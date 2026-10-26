@@ -10,7 +10,11 @@ import { fileURLToPath } from "node:url";
 const args = process.argv.slice(2);
 let files;
 if (args.length === 0) {
-  files = ["tests/integration/store.ts", "tests/integration/receipts.ts"];
+  files = [
+    "tests/integration/store.ts",
+    "tests/integration/receipts.ts",
+    "tests/integration/bridge.ts",
+  ];
 } else if (args.length === 2 && args[0] === "--case") {
   if (args[1] === "J0_store_contract") files = ["tests/integration/store.ts"];
   else if (args[1] === "C1_reconnect_cursor")
