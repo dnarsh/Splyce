@@ -10,6 +10,8 @@ export interface ComposerAvailability {
   stale: boolean;
   /** A prompt was already sent and is not settled yet. */
   pending: boolean;
+  /** Sending is not wired for this session yet; shown as the blocked reason. */
+  unavailable?: string;
 }
 
 const CONNECTION_REASONS: Partial<Record<EngineConnectionState, string>> = {
@@ -26,6 +28,7 @@ export function sendBlockedReason(a: ComposerAvailability): string | null {
   const connection = CONNECTION_REASONS[a.connection];
   if (connection) return connection;
   if (!a.sessionId) return "No session is selected.";
+  if (a.unavailable) return a.unavailable;
   if (a.stale) return "Session state is out of date. Refresh before sending.";
   return null;
 }

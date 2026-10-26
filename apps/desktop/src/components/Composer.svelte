@@ -11,6 +11,7 @@
     connection,
     sessionId,
     stale = false,
+    unavailable,
     cancellable = false,
     contextArtifactIds = [],
     send,
@@ -19,6 +20,7 @@
     connection: EngineConnectionState;
     sessionId: string | null;
     stale?: boolean;
+    unavailable?: string;
     cancellable?: boolean;
     contextArtifactIds?: readonly string[];
     send: (payload: PromptPayload) => Promise<void>;
@@ -31,13 +33,13 @@
   let error = $state<string | null>(null);
 
   const reason = $derived(
-    sendBlockedReason({ connection, sessionId, stale, pending }),
+    sendBlockedReason({ connection, sessionId, stale, pending, unavailable }),
   );
   const payload = $derived(buildPrompt(draft, contextArtifactIds));
 
   async function submit() {
     // Guard on live state: a handler may run before derived values re-render.
-    if (pending || sendBlockedReason({ connection, sessionId, stale, pending }))
+    if (pending || sendBlockedReason({ connection, sessionId, stale, pending, unavailable }))
       return;
     const request = buildPrompt(draft, contextArtifactIds);
     if (!request) return;
