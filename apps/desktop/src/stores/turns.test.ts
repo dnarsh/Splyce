@@ -906,3 +906,35 @@ describe("TD-18 renderer transport", () => {
     expect(transport.rejectedCount()).toBe(1);
   });
 });
+
+describe("reducer event-id memory", () => {
+  it("stays bounded and fast across a long run of events", () => {
+    let state = createTurnsState();
+    state = reduceTurns(
+      state,
+      event(1, "turn.started", { runId: "run_a", turnId: "turn_a" }),
+    );
+    const started = performance.now();
+    for (let seq = 2; seq < 12_002; seq += 1) {
+      state = reduceTurns(state, delta(seq, "x"), { coalesced: true });
+    }
+    const elapsed = performance.now() - started;
+    expect(state.runs.run_a?.text.length).toBe(12_000);
+    expect(state.seenEventIds.size).toBeLessThanOrEqual(4096);
+    // The old per-event Set copy made this O(n^2); the bounded window keeps it linear.
+    expect(elapsed).toBeLessThan(2000);
+  });
+
+  it("still rejects a duplicate that is inside the window", () => {
+    let state = createTurnsState();
+    state = reduceTurns(
+      state,
+      event(1, "turn.started", { runId: "run_a", turnId: "turn_a" }),
+    );
+    const repeated = delta(2, "x");
+    state = reduceTurns(state, repeated);
+    const again = reduceTurns(state, repeated);
+    expect(again.duplicateCount).toBe(state.duplicateCount + 1);
+    expect(again.runs.run_a?.text).toBe("x");
+  });
+});

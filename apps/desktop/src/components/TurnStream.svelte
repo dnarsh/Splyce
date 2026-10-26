@@ -1,6 +1,10 @@
 ﻿<script lang="ts">
   import type { EventPayloads } from "@splyce/pi/contracts";
   import ApprovalCard from "./ApprovalCard.svelte";
+  import {
+    projectToolStatus,
+    projectTurnStatus,
+  } from "../status-view";
   import type { ApprovalView, ToolCallView, TurnView } from "../stores/turns";
 
   type ApprovalDecision = "approve" | "deny";
@@ -25,26 +29,10 @@
     ) => void;
   } = $props();
 
-  const statusLabel: Record<TurnView["status"], string> = {
-    streaming: "Working",
-    waiting_approval: "Waiting for approval",
-    completed: "Completed",
-    failed: "Failed",
-    canceled: "Canceled",
-    stopped: "Stopped",
-  };
-
-  const toolStatusLabel: Record<ToolCallView["status"], string> = {
-    pending: "Pending - not executed",
-    success: "Success",
-    error: "Failed",
-    uncertain: "Uncertain",
-    canceled: "Canceled",
-  };
-
   let actions = $derived(
     new Map(run.actions.map((action) => [action.actionId, action])),
   );
+  let runStatus = $derived(projectTurnStatus(run.status));
   let sending = $state<Record<string, ApprovalDecision>>({});
 
   function approvalRequest(approval: ApprovalView): ApprovalRequest {
@@ -120,8 +108,12 @@
   aria-label="Assistant turn"
 >
   <header class="turn-head">
-    <span class="status" data-status={run.status}>
-      {statusLabel[run.status]}
+    <span
+      class="status"
+      data-status={run.status}
+      data-tone={runStatus.tone}
+    >
+      {runStatus.label}
     </span>
     {#if stale}
       <span class="stale-badge">Stale</span>
@@ -148,6 +140,7 @@
       {:else}
         {@const action = actions.get(block.actionId)}
         {#if action}
+          {@const toolStatus = projectToolStatus(action.status)}
           <article
             class="tool"
             data-testid="tool-card"
@@ -157,8 +150,12 @@
           >
             <div class="tool-head">
               <code class="capability">{action.capabilityId}</code>
-              <span class="tool-status" data-status={action.status}>
-                {toolStatusLabel[action.status]}
+              <span
+                class="tool-status"
+                data-status={action.status}
+                data-tone={toolStatus.tone}
+              >
+                {toolStatus.label}
               </span>
             </div>
             <p class="target">{action.target}</p>
