@@ -54,7 +54,8 @@ export type ModulePlanErrorCode =
   | "ERR_PLAN_PIN"
   | "ERR_PLAN_UNKNOWN_PACKAGE"
   | "ERR_PLAN_MISSING_DEPENDENCY"
-  | "ERR_PLAN_CYCLE";
+  | "ERR_PLAN_CYCLE"
+  | "ERR_PLAN_SHARED_IN_USE";
 
 export class ModulePlanError extends Error {
   readonly code: ModulePlanErrorCode;
@@ -303,6 +304,18 @@ export function planRemove(input: {
         removed.add(module.id);
         changed = true;
       }
+    }
+  }
+  // A shared dependency still owned by a module that stays cannot be removed, even when asked for by name.
+  for (const id of input.remove) {
+    const stays = byId
+      .get(id)!
+      .ownerRefs.filter((owner) => !removed.has(owner));
+    if (stays.length > 0) {
+      throw new ModulePlanError(
+        "ERR_PLAN_SHARED_IN_USE",
+        `${id} is still required by ${stays.sort().join(", ")}`,
+      );
     }
   }
   const retained = input.installed

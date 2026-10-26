@@ -214,3 +214,21 @@ test("a size change after review makes the plan not current", () => {
   assert.equal(result.current, false);
   assert.ok(result.reasons.some((r) => r.includes("ls-ts")));
 });
+
+test("a shared dependency still owned by a module that stays cannot be removed by name", () => {
+  const installed = [
+    { id: "a", ownerRefs: [] },
+    { id: "b", ownerRefs: [] },
+    { id: "shared", ownerRefs: ["a", "b"] },
+  ];
+  for (const remove of [["shared"], ["a", "shared"]]) {
+    assert.throws(
+      () => planRemove({ installed, remove }),
+      (e) => e.code === "ERR_PLAN_SHARED_IN_USE" && /b/.test(e.message),
+    );
+  }
+  const both = planRemove({ installed, remove: ["a", "b", "shared"] });
+  assert.deepEqual([...both.removeCode], ["a", "b", "shared"]);
+  const cascade = planRemove({ installed, remove: ["a", "b"] });
+  assert.deepEqual([...cascade.removeCode], ["a", "b", "shared"]);
+});
