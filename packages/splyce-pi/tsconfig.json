@@ -12,12 +12,14 @@
     "rootDir": "src",
     "outDir": "dist",
     "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": false
+    "skipLibCheck": false,
+    "types": []
   },
   "include": [
     "src/contracts.ts",
     "src/store.ts",
     "src/receipts.ts",
+    "src/config.ts",
     "src/desktop-bridge.ts",
     "src/node-sqlite.d.ts"
   ]

@@ -73,6 +73,7 @@ function notifyState(next: EngineConnectionState) {
 async function getTauriInvoke(): Promise<
   ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null
 > {
+  if (typeof window === "undefined") return null;
   try {
     // Dynamic import to satisfy @tauri-apps/api/core module resolution in packaged Tauri WebView
     const core = (await import("@tauri-apps/api/core" as string)) as {
@@ -192,10 +193,9 @@ export async function subscribe(
   const dispose = () => {
     if (disposed) return;
     disposed = true;
+    // The native subscription ends with its channel (#61). Unsubscribing never
+    // reaches the engine as a cancel: cancel always means cancel the run.
     activeSubscriptions.delete(sessionId);
-    invokeTauri("cancel", { sessionId, reason: "CLIENT_UNSUBSCRIBED" }).catch(
-      () => {},
-    );
   };
 
   activeSubscriptions.set(sessionId, dispose);
