@@ -1,6 +1,5 @@
-// TD-27 failing-first tests for packages/splyce-pi/src/module-plan.ts.
-// Prep only: the module does not exist yet, so this suite must fail until TD-27 lands.
-// Names (planInstall, checkPlan, planRemove) are proposals pending TD-01/TD-26/TD-28 contracts.
+// TD-27 cases for packages/splyce-pi/src/module-plan.ts (written failing-first, now gating the planner).
+// Names (planInstall, checkPlan, planRemove) remain proposals pending TD-01/TD-26/TD-28 contracts.
 import assert from "node:assert/strict";
 import test from "node:test";
 import { planInstall, checkPlan, planRemove } from "@splyce/pi/module-plan";
@@ -179,7 +178,7 @@ test("removal keeps a dependency another installed root still needs", () => {
     ],
     remove: ["b"],
   });
-  assert.deepEqual(last.removeCode.sort(), ["b", "shared"]);
+  assert.deepEqual([...last.removeCode].sort(), ["b", "shared"]);
 });
 
 test("removal never deletes retained user data", () => {
@@ -191,4 +190,27 @@ test("removal never deletes retained user data", () => {
   });
   assert.deepEqual(plan.retainedArtifactRefs, ["art1"]);
   assert.equal(plan.deletesData, false);
+});
+
+test("only a package that asks for setup execution is listed for it", () => {
+  const cat = catalog().map((e) =>
+    e.id === "ls-ts"
+      ? { ...e, setup: { executes: false } }
+      : e.id === "lsp"
+        ? { ...e, setup: { executes: true } }
+        : e,
+  );
+  const plan = planInstall({ catalog: cat, selected: ["lsp"] });
+  assert.deepEqual(plan.setupExecution, ["lsp"]);
+});
+
+test("a size change after review makes the plan not current", () => {
+  const cat = catalog();
+  const plan = planInstall({ catalog: cat, selected: ["lsp"] });
+  const resized = cat.map((e) =>
+    e.id === "ls-ts" ? { ...e, sizeBytes: 5001 } : e,
+  );
+  const result = checkPlan(plan, resized);
+  assert.equal(result.current, false);
+  assert.ok(result.reasons.some((r) => r.includes("ls-ts")));
 });

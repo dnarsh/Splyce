@@ -15,13 +15,14 @@
     "test:receipts-cursor": "node scripts/run-store.mjs --case C1_reconnect_cursor",
     "test:desktop-bridge": "node scripts/run-store.mjs --case C2_desktop_bridge",
     "test:config-transition": "node scripts/run-store.mjs --case C4_config_transition",
-    "test:release-gate": "npm run test:contracts && npm run test:store-contract && npm run test:receipts-cursor && npm run test:desktop-bridge && npm run test:config-transition && npm run test:gui-fixtures && npm run test:engine-store && npm run test:desktop",
+    "test:release-gate": "npm run test:contracts && npm run test:store-contract && npm run test:receipts-cursor && npm run test:desktop-bridge && npm run test:config-transition && npm run test:gui-fixtures && npm run test:engine-store && npm run test:module-plan && npm run test:desktop",
     "format:check": "prettier --check .",
     "format": "prettier --write .",
     "lint:markdown": "markdownlint-cli2 \"**/*.md\" \".skills/**/*.md\" \".github/**/*.md\" \"#node_modules\"",
     "check:docs": "python scripts/check_docs.py",
     "test:docs": "python -m unittest tests/test_check_docs.py",
-    "test:desktop": "npm run check --workspace=@splyce/desktop && npm run test --workspace=@splyce/desktop"
+    "test:desktop": "npm run check --workspace=@splyce/desktop && npm run test --workspace=@splyce/desktop",
+    "test:module-plan": "node --test tests/module-plan.test.mjs"
   },
   "devDependencies": {
     "markdownlint-cli2": "0.24.0",

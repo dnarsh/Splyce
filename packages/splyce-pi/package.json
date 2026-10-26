@@ -7,6 +7,10 @@
     "./contracts": {
       "types": "./dist/contracts.d.ts",
       "import": "./dist/contracts.js"
+    },
+    "./module-plan": {
+      "types": "./dist/module-plan.d.ts",
+      "import": "./dist/module-plan.js"
     }
   },
   "files": [
