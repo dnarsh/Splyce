@@ -20,6 +20,7 @@
     "src/store.ts",
     "src/receipts.ts",
     "src/config.ts",
+    "src/jobs.ts",
     "src/desktop-bridge.ts",
     "src/node-sqlite.d.ts"
   ]
