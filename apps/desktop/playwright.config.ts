@@ -3,7 +3,7 @@
 const executablePath = process.env.SPLYCE_BROWSER_PATH;
 
 export default defineConfig({
-  testDir: "./tests/td18",
+  testDir: "./tests",
   testMatch: /.*\.e2e\.spec\.ts/,
   fullyParallel: false,
   use: {

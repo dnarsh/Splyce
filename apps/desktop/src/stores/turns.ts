@@ -255,6 +255,18 @@ function missingPayload(state: TurnsState): TurnsState {
   return { ...state, protocolErrors: state.protocolErrors + 1 };
 }
 
+const EVENT_ID_WINDOW = 4096;
+
+/**
+ * Remembers an event id in a bounded window instead of copying the whole set per event, which made a burst of n events
+ * cost O(n^2). Anything older than the window is already rejected by the sequence checks, so pruning loses nothing.
+ */
+function rememberEventId(seen: Set<string>, eventId: string): Set<string> {
+  seen.add(eventId);
+  if (seen.size > EVENT_ID_WINDOW) seen.delete(seen.values().next().value!);
+  return seen;
+}
+
 // Mirrors the subscribe cursor to the engine; TD-15 owns replay, TD-18 owns gap detection.
 export function reduceTurns(
   state: TurnsState,
@@ -302,7 +314,7 @@ export function reduceTurns(
       envelope.durable && !isSnapshot
         ? Math.max(state.lastDurableSeq, envelope.seq)
         : state.lastDurableSeq,
-    seenEventIds: new Set(state.seenEventIds).add(envelope.eventId),
+    seenEventIds: rememberEventId(state.seenEventIds, envelope.eventId),
   };
 
   if (!("payload" in envelope)) {
@@ -579,8 +591,6 @@ interface SessionChannel {
   replayUntil: number;
   seenEventIds: Set<string>;
 }
-
-const EVENT_ID_WINDOW = 4096;
 
 export interface TurnStreamTransportOptions {
   state?: TurnsState;

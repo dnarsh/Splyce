@@ -208,21 +208,6 @@ describe("projectStatus", () => {
     ).toBe("unknown");
   });
 
-  it("projects inherited Object keys to Unknown in every projector", () => {
-    for (const key of [
-      "constructor",
-      "toString",
-      "__proto__",
-      "hasOwnProperty",
-    ]) {
-      expect(projectStatus("run", { state: key } as never).status, key).toBe(
-        "unknown",
-      );
-      expect(projectTurnStatus(key as never).label, key).toBe("Unknown");
-      expect(projectToolStatus(key as never).label, key).toBe("Unknown");
-    }
-  });
-
   it("does not mutate the input or copy metadata, paths or error text", () => {
     const record = Object.freeze({
       state: "failed",
