@@ -33,6 +33,7 @@ const artifacts = {
   "ls-ts": enc("typescript language server bytes"),
   embedder: enc("embedder weights"),
   setupy: enc("#!/bin/sh\ntouch RAN_SETUP\n"),
+  tool: enc("tool bytes"),
 };
 const entry = (id, over = {}) => ({
   id,
@@ -44,11 +45,21 @@ const entry = (id, over = {}) => ({
   requires: [],
   ...over,
 });
+const TRUST = generateKeyPairSync("ed25519");
+const TRUST_PEM = TRUST.publicKey.export({ type: "spki", format: "pem" });
+const verified = (cat) => {
+  const bytes = enc(JSON.stringify({ entries: cat }));
+  return verifyCatalog(
+    { bytes, signature: new Uint8Array(sign(null, bytes, TRUST.privateKey)) },
+    TRUST_PEM,
+  );
+};
 const catalog = () => [
   entry("lsp", { requires: ["ls-ts"] }),
   entry("ls-ts"),
   entry("embedder"),
   entry("setupy", { setup: { executes: true } }),
+  entry("tool", { requires: ["ls-ts"] }),
 ];
 
 async function fixtureServer(served = artifacts, commits = {}) {
@@ -107,6 +118,12 @@ async function fileStore(root, faults = {}) {
       await rename(at(from), at(to));
     },
     async remove(path) {
+      if (
+        faults.remove === path ||
+        (faults.remove === "*" && path.startsWith("staging"))
+      ) {
+        throw new Error("remove failed");
+      }
       await rm(at(path), { recursive: true, force: true });
     },
     async read(path) {
@@ -125,8 +142,18 @@ async function fileStore(root, faults = {}) {
         throw error;
       }
     },
-    async saveRecords(json) {
+    async saveRecords(json, expectedPrevious) {
       if (faults.records) throw new Error("records write failed");
+      if (faults.slowSave) await faults.slowSave();
+      let current = null;
+      try {
+        current = await readFile(at("installed.json"), "utf8");
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      if (current !== expectedPrevious) {
+        throw Object.assign(new Error("records changed"), { conflict: true });
+      }
       await writeFile(at("installed.json.tmp"), json);
       await rename(at("installed.json.tmp"), at("installed.json"));
     },
@@ -164,7 +191,7 @@ test("I1_selected_closure: only the selected closure is fetched, verified and re
   await withEnv(async ({ root, store, source, hits }) => {
     const { added } = await acquire({
       plan: planFor(["lsp"]),
-      catalog: catalog(),
+      catalog: verified(catalog()),
       source,
       store,
     });
@@ -191,14 +218,14 @@ test("I1_selected_closure: a second acquisition reuses what is installed and fet
   await withEnv(async ({ store, source, hits }) => {
     await acquire({
       plan: planFor(["lsp"]),
-      catalog: catalog(),
+      catalog: verified(catalog()),
       source,
       store,
     });
     hits.length = 0;
     const again = await acquire({
       plan: planFor(["lsp"]),
-      catalog: catalog(),
+      catalog: verified(catalog()),
       source,
       store,
     });
@@ -216,7 +243,12 @@ test("I1_pin_integrity: a byte change fails the digest and nothing is promoted o
   await withEnv(
     async ({ root, store, source }) => {
       await assert.rejects(
-        acquire({ plan: planFor(["lsp"]), catalog: catalog(), source, store }),
+        acquire({
+          plan: planFor(["lsp"]),
+          catalog: verified(catalog()),
+          source,
+          store,
+        }),
         (e) =>
           e.code === "ERR_ACQ_DIGEST_MISMATCH" ||
           e.code === "ERR_ACQ_SIZE_MISMATCH",
@@ -233,7 +265,12 @@ test("I1_pin_integrity: same-size tampered bytes are caught by the digest, with 
   await withEnv(
     async ({ root, store, source }) => {
       await assert.rejects(
-        acquire({ plan: planFor(["lsp"]), catalog: catalog(), source, store }),
+        acquire({
+          plan: planFor(["lsp"]),
+          catalog: verified(catalog()),
+          source,
+          store,
+        }),
         (e) => e.code === "ERR_ACQ_DIGEST_MISMATCH",
       );
       assert.deepEqual(await tree(root), []);
@@ -248,7 +285,7 @@ test("I1_pin_integrity: bytes built from another commit are refused", async () =
       await assert.rejects(
         acquire({
           plan: planFor(["ls-ts"]),
-          catalog: catalog(),
+          catalog: verified(catalog()),
           source,
           store,
         }),
@@ -267,7 +304,7 @@ test("I1_pin_integrity: a plan made stale by a catalog change acquires nothing",
       e.id === "ls-ts" ? { ...e, commit: "c".repeat(40) } : e,
     );
     await assert.rejects(
-      acquire({ plan, catalog: moved, source, store }),
+      acquire({ plan, catalog: verified(moved), source, store }),
       (e) => e.code === "ERR_ACQ_STALE_PLAN",
     );
     assert.deepEqual(hits, []);
@@ -290,7 +327,7 @@ test("I1_interrupt: an interrupt mid-closure leaves no record, no promoted bytes
     await assert.rejects(
       acquire({
         plan: planFor(["lsp"]),
-        catalog: catalog(),
+        catalog: verified(catalog()),
         source: interrupting,
         store,
         signal: controller.signal,
@@ -305,7 +342,12 @@ test("I1_interrupt: a store failure after promotion removes what was promoted an
   await withEnv(
     async ({ root, store, source }) => {
       await assert.rejects(
-        acquire({ plan: planFor(["lsp"]), catalog: catalog(), source, store }),
+        acquire({
+          plan: planFor(["lsp"]),
+          catalog: verified(catalog()),
+          source,
+          store,
+        }),
         (e) => e.code === "ERR_ACQ_STORE",
       );
       assert.deepEqual(await tree(root), []);
@@ -319,7 +361,7 @@ test("I1_interrupt: a store failure after promotion removes what was promoted an
       promote: `modules/${last.id}/${last.digest.slice(7)}`,
     });
     await assert.rejects(
-      acquire({ plan, catalog: catalog(), source, store: faulty }),
+      acquire({ plan, catalog: verified(catalog()), source, store: faulty }),
       (e) => e.code === "ERR_ACQ_STORE",
     );
     assert.deepEqual(await tree(root), []);
@@ -330,7 +372,7 @@ test("I1_explicit_execution: a setup request is recorded as pending, never run a
   await withEnv(async ({ root, store, source }) => {
     const { added } = await acquire({
       plan: planFor(["setupy"]),
-      catalog: catalog(),
+      catalog: verified(catalog()),
       source,
       store,
     });
@@ -350,7 +392,7 @@ test("I1_custom_plugin_source: a custom source is refused until acknowledged, th
     await assert.rejects(
       acquire({
         plan: planFor(["ls-ts"]),
-        catalog: catalog(),
+        catalog: verified(catalog()),
         source,
         store,
         origin: "custom",
@@ -361,7 +403,7 @@ test("I1_custom_plugin_source: a custom source is refused until acknowledged, th
     assert.deepEqual(await tree(root), []);
     const { added } = await acquire({
       plan: planFor(["ls-ts"]),
-      catalog: catalog(),
+      catalog: verified(catalog()),
       source,
       store,
       origin: "custom",
@@ -375,7 +417,12 @@ test("C4_provision_offline: with no network the failure is explicit and nothing 
   await withEnv(async ({ root, store, source, close }) => {
     await close();
     await assert.rejects(
-      acquire({ plan: planFor(["lsp"]), catalog: catalog(), source, store }),
+      acquire({
+        plan: planFor(["lsp"]),
+        catalog: verified(catalog()),
+        source,
+        store,
+      }),
       (e) => e.code === "ERR_ACQ_OFFLINE",
     );
     assert.deepEqual(await tree(root), []);
@@ -386,7 +433,7 @@ test("startup read is read-only: it reports changed or missing bytes and an unre
   await withEnv(async ({ root, store, source, hits }) => {
     await acquire({
       plan: planFor(["lsp"]),
-      catalog: catalog(),
+      catalog: verified(catalog()),
       source,
       store,
     });
@@ -418,7 +465,7 @@ test("trust root: only a catalog signed by the compiled-in key is accepted", () 
   const pem = (k) => k.publicKey.export({ type: "spki", format: "pem" });
   const bytes = enc(JSON.stringify({ entries: catalog() }));
   const signature = new Uint8Array(sign(null, bytes, good.privateKey));
-  assert.equal(verifyCatalog({ bytes, signature }, pem(good)).length, 4);
+  assert.equal(verifyCatalog({ bytes, signature }, pem(good)).length, 5);
   const tampered = enc(
     JSON.stringify({
       entries: catalog().map((e) => ({ ...e, digest: digestOf(enc("evil")) })),
@@ -452,7 +499,12 @@ test("module ids that could escape the store are refused before anything is fetc
     const cat = [entry("ls-ts", { id })];
     await withEnv(async ({ root, store, source, hits }) => {
       await assert.rejects(
-        acquire({ plan: planFor([id], cat), catalog: cat, source, store }),
+        acquire({
+          plan: planFor([id], cat),
+          catalog: verified(cat),
+          source,
+          store,
+        }),
         (e) => e.code === "ERR_ACQ_BAD_ID",
         id,
       );
@@ -460,4 +512,211 @@ test("module ids that could escape the store are refused before anything is fetc
       assert.deepEqual(await tree(root), []);
     });
   }
+});
+
+test("official acquisition refuses a catalog that did not come from verifyCatalog", async () => {
+  await withEnv(async ({ root, store, source, hits }) => {
+    await assert.rejects(
+      acquire({ plan: planFor(["ls-ts"]), catalog: catalog(), source, store }),
+      (e) => e.code === "ERR_ACQ_CATALOG_UNTRUSTED",
+    );
+    assert.deepEqual(hits, []);
+    assert.deepEqual(await tree(root), []);
+    const forged = Object.freeze([...verified(catalog())]);
+    await assert.rejects(
+      acquire({ plan: planFor(["ls-ts"]), catalog: forged, source, store }),
+      (e) => e.code === "ERR_ACQ_CATALOG_UNTRUSTED",
+    );
+    const { added } = await acquire({
+      plan: planFor(["ls-ts"]),
+      catalog: catalog(),
+      source,
+      store,
+      origin: "custom",
+      customAcknowledged: true,
+    });
+    assert.equal(added[0].origin, "custom");
+  });
+});
+
+test("a supplied closure that differs from the reviewed roots installs nothing", async () => {
+  await withEnv(async ({ root, store, source, hits }) => {
+    const plan = planFor(["ls-ts"]);
+    const extra = planFor(["embedder"]).closure[0];
+    const forged = { ...plan, closure: [...plan.closure, extra] };
+    await assert.rejects(
+      acquire({ plan: forged, catalog: verified(catalog()), source, store }),
+      (e) => e.code === "ERR_ACQ_STALE_PLAN",
+    );
+    assert.deepEqual(hits, []);
+    assert.deepEqual(await tree(root), []);
+  });
+});
+
+test("an interrupt during promotion is reported as interrupted, never as success", async () => {
+  await withEnv(async ({ root, source }) => {
+    const controller = new AbortController();
+    const inner = await fileStore(root);
+    const store = {
+      ...inner,
+      promote: async (from, to) => {
+        await inner.promote(from, to);
+        controller.abort();
+      },
+    };
+    await assert.rejects(
+      acquire({
+        plan: planFor(["lsp"]),
+        catalog: verified(catalog()),
+        source,
+        store,
+        signal: controller.signal,
+      }),
+      (e) => e.code === "ERR_ACQ_INTERRUPTED",
+    );
+    assert.deepEqual(await tree(root), []);
+  });
+});
+
+test("two acquisitions on one store are serialized and both records survive", async () => {
+  await withEnv(async ({ store, source }) => {
+    const cat = verified(catalog());
+    const [a, b] = await Promise.all([
+      acquire({ plan: planFor(["lsp"]), catalog: cat, source, store }),
+      acquire({ plan: planFor(["embedder"]), catalog: cat, source, store }),
+    ]);
+    assert.equal(a.added.length + b.added.length, 3);
+    const ids = JSON.parse(await store.loadRecords())
+      .map((r) => r.id)
+      .sort();
+    assert.deepEqual(ids, ["embedder", "ls-ts", "lsp"]);
+  });
+});
+
+test("independent writers on the same files cannot overwrite each other: the loser conflicts and cleans up", async () => {
+  await withEnv(async ({ root, source }) => {
+    const gate = { release: null };
+    const slow = new Promise((r) => (gate.release = r));
+    const a = await fileStore(root, { slowSave: () => slow });
+    const b = await fileStore(root);
+    const cat = verified(catalog());
+    const first = acquire({
+      plan: planFor(["lsp"]),
+      catalog: cat,
+      source,
+      store: a,
+    });
+    const second = await acquire({
+      plan: planFor(["embedder"]),
+      catalog: cat,
+      source,
+      store: b,
+    });
+    assert.equal(second.added.length, 1);
+    gate.release();
+    await assert.rejects(first, (e) => e.code === "ERR_ACQ_CONFLICT");
+    const ids = JSON.parse(await b.loadRecords()).map((r) => r.id);
+    assert.deepEqual(ids, ["embedder"]);
+    const files = await tree(root);
+    assert.equal(
+      files.some(
+        (f) => f.includes("modules/lsp") || f.includes("modules/ls-ts"),
+      ),
+      false,
+    );
+  });
+});
+
+test("a cleanup that cannot remove staged bytes says so instead of claiming nothing was installed", async () => {
+  await withEnv(async ({ root, source }) => {
+    const store = await fileStore(root, { records: true, remove: "*" });
+    await assert.rejects(
+      acquire({
+        plan: planFor(["lsp"]),
+        catalog: verified(catalog()),
+        source,
+        store,
+      }),
+      (e) =>
+        e.code === "ERR_ACQ_STORE" &&
+        /cleanup incomplete/.test(e.message) &&
+        /staging/.test(e.message),
+    );
+  });
+});
+
+test("records carry owner refs and a reused dependency gains the new owner", async () => {
+  await withEnv(async ({ store, source, hits }) => {
+    const cat = verified(catalog());
+    await acquire({ plan: planFor(["lsp"]), catalog: cat, source, store });
+    let records = JSON.parse(await store.loadRecords());
+    assert.deepEqual(records.find((r) => r.id === "ls-ts").ownerRefs, ["lsp"]);
+    assert.deepEqual(records.find((r) => r.id === "lsp").ownerRefs, []);
+    hits.length = 0;
+    const second = await acquire({
+      plan: planFor(["tool"]),
+      catalog: cat,
+      source,
+      store,
+    });
+    assert.deepEqual(hits, ["tool"]);
+    assert.deepEqual(second.reused, ["ls-ts"]);
+    records = JSON.parse(await store.loadRecords());
+    assert.deepEqual(records.find((r) => r.id === "ls-ts").ownerRefs, [
+      "lsp",
+      "tool",
+    ]);
+  });
+});
+
+test("an interrupt stops further promotions, and one after the last promotion still blocks the record", async () => {
+  for (const abortAt of [1, 2]) {
+    await withEnv(async ({ root, source }) => {
+      const controller = new AbortController();
+      const inner = await fileStore(root);
+      let promotes = 0;
+      const store = {
+        ...inner,
+        promote: async (from, to) => {
+          promotes += 1;
+          await inner.promote(from, to);
+          if (promotes === abortAt) controller.abort();
+        },
+      };
+      await assert.rejects(
+        acquire({
+          plan: planFor(["lsp"]),
+          catalog: verified(catalog()),
+          source,
+          store,
+          signal: controller.signal,
+        }),
+        (e) => e.code === "ERR_ACQ_INTERRUPTED",
+      );
+      assert.equal(promotes, abortAt);
+      assert.equal(await store.loadRecords(), null);
+      assert.deepEqual(await tree(root), []);
+    });
+  }
+});
+
+test("a typed failure with a cleanup that cannot finish also names the leftover bytes", async () => {
+  const tampered = { ...artifacts, lsp: enc("lsp package bytez") };
+  await withEnv(
+    async ({ root, source }) => {
+      const store = await fileStore(root, { remove: "*" });
+      await assert.rejects(
+        acquire({
+          plan: planFor(["lsp"]),
+          catalog: verified(catalog()),
+          source,
+          store,
+        }),
+        (e) =>
+          e.code === "ERR_ACQ_DIGEST_MISMATCH" &&
+          /cleanup incomplete/.test(e.message),
+      );
+    },
+    { served: tampered },
+  );
 });

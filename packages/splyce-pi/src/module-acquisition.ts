@@ -13,7 +13,7 @@
 // module lifecycle to TD-37, which consume these records.
 import { createHash, createPublicKey, verify } from "node:crypto";
 import type { CatalogEntry, InstallPlan, PlanEntry } from "./module-plan.js";
-import { checkPlan } from "./module-plan.js";
+import { checkPlan, planInstall } from "./module-plan.js";
 
 export type ModuleAcquisitionErrorCode =
   | "ERR_ACQ_STALE_PLAN"
@@ -52,14 +52,18 @@ export interface ArtifactSource {
   ): Promise<ArtifactBytes>;
 }
 
-/** File access the acquisition needs. `saveRecords` must replace the record file atomically. */
+/**
+ * File access the acquisition needs. `saveRecords` must replace the record file atomically AND only when the stored
+ * text still equals `expectedPrevious` (compare-and-swap); otherwise it rejects with `{ conflict: true }` so a
+ * concurrent acquisition can never be silently overwritten.
+ */
 export interface AcquisitionStore {
   stage(path: string, bytes: Uint8Array): Promise<void>;
   promote(from: string, to: string): Promise<void>;
   remove(path: string): Promise<void>;
   read(path: string): Promise<Uint8Array | null>;
   loadRecords(): Promise<string | null>;
-  saveRecords(json: string): Promise<void>;
+  saveRecords(json: string, expectedPrevious: string | null): Promise<void>;
 }
 
 export type ModuleOrigin = "official" | "custom";
@@ -73,6 +77,8 @@ export interface InstalledRecord {
   readonly origin: ModuleOrigin;
   /** Where the verified bytes live, relative to the store root. */
   readonly installDir: string;
+  /** Installed modules that require this one (TD-27 `ownerRefs`): removal planning keeps it while any remain. */
+  readonly ownerRefs: readonly string[];
   /** Always false from acquisition: enabling is a separate, user-confirmed configuration transition (TD-26). */
   readonly enabled: false;
   /** The package asked to run setup code. It is reported only; acquisition never runs it. */
@@ -90,6 +96,16 @@ export interface AcquireInput {
   readonly customAcknowledged?: boolean;
   readonly signal?: AbortSignal;
 }
+
+const verifiedCatalogs = new WeakSet<object>();
+
+/** True only for a list returned by `verifyCatalog`: an unsigned array is never an official catalog. */
+export function isVerifiedCatalog(catalog: readonly CatalogEntry[]): boolean {
+  return verifiedCatalogs.has(catalog);
+}
+
+/** Acquisitions on one store run one at a time in this process; across processes `saveRecords` compares-and-swaps. */
+const queues = new WeakMap<object, Promise<unknown>>();
 
 /** Lowercase letters, digits, `.`, `_`, `-`; no leading dot, so no `..`, separators or drive prefixes. */
 const MODULE_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -160,14 +176,49 @@ async function fetchVerified(
   return artifact.bytes;
 }
 
-/**
- * Acquires and records the closure of a reviewed plan. Resolves with the records it added (already-installed entries
- * with the same digest are reused, not re-fetched). On any failure nothing is promoted, recorded or left staged.
- */
-export async function acquire(input: AcquireInput): Promise<{
+const closureKey = (entries: readonly PlanEntry[]): string =>
+  JSON.stringify(
+    entries.map((e) => [
+      e.id,
+      e.commit,
+      e.path,
+      e.digest,
+      e.license,
+      e.sizeBytes,
+      e.selected,
+    ]),
+  );
+
+const union = (a: readonly string[], b: readonly string[]): string[] =>
+  [...new Set([...a, ...b])].sort();
+
+export interface AcquireResult {
   readonly added: readonly InstalledRecord[];
   readonly reused: readonly string[];
-}> {
+  /** Paths that could not be removed after success (staging); harmless to activation, listed for cleanup. */
+  readonly leftover: readonly string[];
+}
+
+/**
+ * Acquires and records the closure of a reviewed plan. The closure is re-derived from the catalog and the reviewed
+ * roots, never taken from the caller's plan object. Already-installed entries with the same pin are reused (and gain
+ * the new owners). Official acquisition needs a catalog that came from `verifyCatalog`. On any failure nothing is
+ * recorded; leftover unrecorded bytes that could not be removed are reported, never hidden.
+ */
+export function acquire(input: AcquireInput): Promise<AcquireResult> {
+  const previous = queues.get(input.store) ?? Promise.resolve();
+  const run = previous.then(
+    () => acquireNow(input),
+    () => acquireNow(input),
+  );
+  queues.set(
+    input.store,
+    run.catch(() => undefined),
+  );
+  return run;
+}
+
+async function acquireNow(input: AcquireInput): Promise<AcquireResult> {
   const { plan, catalog, source, store, signal } = input;
   const origin = input.origin ?? "official";
   if (origin === "custom" && input.customAcknowledged !== true) {
@@ -176,14 +227,11 @@ export async function acquire(input: AcquireInput): Promise<{
       "a custom source needs the user to acknowledge it before anything is fetched",
     );
   }
-  // Module ids become path segments: refuse anything that could leave `modules/` or `staging/` before touching a store.
-  for (const entry of plan.closure) {
-    if (!MODULE_ID.test(entry.id)) {
-      throw new ModuleAcquisitionError(
-        "ERR_ACQ_BAD_ID",
-        `module id ${JSON.stringify(entry.id)} is not a safe path segment`,
-      );
-    }
+  if (origin === "official" && !isVerifiedCatalog(catalog)) {
+    throw new ModuleAcquisitionError(
+      "ERR_ACQ_CATALOG_UNTRUSTED",
+      "official acquisition needs a catalog verified against the trust root",
+    );
   }
   const check = checkPlan(plan, catalog);
   if (!check.current) {
@@ -192,18 +240,59 @@ export async function acquire(input: AcquireInput): Promise<{
       `the reviewed plan is stale: ${check.reasons.join("; ")}`,
     );
   }
+  // The caller's plan object only names the reviewed roots and identity; what gets installed is re-derived.
+  let fresh: InstallPlan;
+  try {
+    fresh = planInstall({ catalog, selected: plan.roots });
+  } catch {
+    throw new ModuleAcquisitionError(
+      "ERR_ACQ_STALE_PLAN",
+      "the reviewed roots no longer resolve",
+    );
+  }
+  if (
+    fresh.planId !== plan.planId ||
+    closureKey(fresh.closure) !== closureKey(plan.closure)
+  ) {
+    throw new ModuleAcquisitionError(
+      "ERR_ACQ_STALE_PLAN",
+      "the supplied closure differs from the reviewed roots",
+    );
+  }
+  // Module ids become path segments: refuse anything that could leave `modules/` or `staging/` before touching a store.
+  for (const entry of fresh.closure) {
+    if (!MODULE_ID.test(entry.id)) {
+      throw new ModuleAcquisitionError(
+        "ERR_ACQ_BAD_ID",
+        `module id ${JSON.stringify(entry.id)} is not a safe path segment`,
+      );
+    }
+  }
   interrupted(signal);
 
-  const existing = parseRecords(await store.loadRecords());
+  const requires = new Map(catalog.map((e) => [e.id, e.requires]));
+  const ownersOf = (id: string): string[] =>
+    fresh.closure
+      .filter((e) => requires.get(e.id)?.includes(id))
+      .map((e) => e.id)
+      .sort();
+
+  const loaded = await store.loadRecords();
+  const existing = parseRecords(loaded);
   const byId = new Map(existing.map((r) => [r.id, r]));
   const reused: string[] = [];
   const todo: PlanEntry[] = [];
-  for (const entry of plan.closure) {
+  const updates = new Map<string, InstalledRecord>();
+  for (const entry of fresh.closure) {
     const have = byId.get(entry.id);
     if (!have) todo.push(entry);
-    else if (have.digest === entry.digest && have.commit === entry.commit)
+    else if (have.digest === entry.digest && have.commit === entry.commit) {
       reused.push(entry.id);
-    else
+      const owners = union(have.ownerRefs ?? [], ownersOf(entry.id));
+      if (owners.join() !== (have.ownerRefs ?? []).join()) {
+        updates.set(entry.id, { ...have, ownerRefs: owners });
+      }
+    } else
       throw new ModuleAcquisitionError(
         "ERR_ACQ_CONFLICT",
         `${entry.id} is installed at a different pin; updates are a separate reviewed operation`,
@@ -213,9 +302,13 @@ export async function acquire(input: AcquireInput): Promise<{
   const stagingRoot = `staging/${plan.planId.replace(/[^a-z0-9]/gi, "_")}`;
   const staged: { entry: PlanEntry; path: string }[] = [];
   const promoted: string[] = [];
-  const cleanup = async (): Promise<void> => {
-    for (const dir of promoted) await store.remove(dir).catch(() => undefined);
-    await store.remove(stagingRoot).catch(() => undefined);
+  const cleanup = async (): Promise<string[]> => {
+    const leftover: string[] = [];
+    for (const dir of promoted) {
+      await store.remove(dir).catch(() => leftover.push(dir));
+    }
+    await store.remove(stagingRoot).catch(() => leftover.push(stagingRoot));
+    return leftover;
   };
   try {
     for (const entry of todo) {
@@ -225,35 +318,50 @@ export async function acquire(input: AcquireInput): Promise<{
       await store.stage(path, bytes);
       staged.push({ entry, path });
     }
-    interrupted(signal);
     for (const { entry, path } of staged) {
+      interrupted(signal);
       const dir = installDirOf(entry);
       await store.promote(path, dir);
       promoted.push(dir);
     }
+    interrupted(signal);
     const added = staged.map(({ entry }): InstalledRecord => ({
       id: entry.id,
       commit: entry.commit,
       digest: entry.digest,
       path: entry.path,
-      planId: plan.planId,
+      planId: fresh.planId,
       origin,
       installDir: installDirOf(entry),
+      ownerRefs: ownersOf(entry.id),
       enabled: false,
-      setupRequested: plan.setupExecution.includes(entry.id),
+      setupRequested: fresh.setupExecution.includes(entry.id),
       setupExecuted: false,
     }));
-    if (added.length > 0) {
-      await store.saveRecords(JSON.stringify([...existing, ...added]));
+    if (added.length > 0 || updates.size > 0) {
+      const next = [...existing.map((r) => updates.get(r.id) ?? r), ...added];
+      await store.saveRecords(JSON.stringify(next), loaded);
     }
-    await store.remove(stagingRoot).catch(() => undefined);
-    return { added, reused };
+    const leftover: string[] = [];
+    await store.remove(stagingRoot).catch(() => leftover.push(stagingRoot));
+    return { added, reused, leftover };
   } catch (error) {
-    await cleanup();
-    if (error instanceof ModuleAcquisitionError) throw error;
+    const leftover = await cleanup();
+    const note =
+      leftover.length > 0
+        ? `; cleanup incomplete, unrecorded bytes may remain at ${leftover.join(", ")} (nothing was activated or recorded)`
+        : "";
+    if (error instanceof ModuleAcquisitionError) {
+      if (note) error.message += note;
+      throw error;
+    }
+    const conflict =
+      (error as { conflict?: unknown } | null)?.conflict === true;
     throw new ModuleAcquisitionError(
-      "ERR_ACQ_STORE",
-      "the store failed; nothing was installed",
+      conflict ? "ERR_ACQ_CONFLICT" : "ERR_ACQ_STORE",
+      conflict
+        ? `another acquisition changed the records first; nothing was recorded${note}`
+        : `the store failed; nothing was recorded${note}`,
     );
   }
 }
@@ -328,5 +436,7 @@ export function verifyCatalog(
       "the catalog has no entries list",
     );
   }
-  return parsed.entries as CatalogEntry[];
+  const entries = Object.freeze([...(parsed.entries as CatalogEntry[])]);
+  verifiedCatalogs.add(entries);
+  return entries;
 }
