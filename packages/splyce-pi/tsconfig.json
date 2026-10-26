@@ -19,6 +19,8 @@
     "src/store.ts",
     "src/receipts.ts",
     "src/desktop-bridge.ts",
+    "src/snapshots.ts",
+    "src/node-builtins.d.ts",
     "src/node-sqlite.d.ts"
   ]
 }
