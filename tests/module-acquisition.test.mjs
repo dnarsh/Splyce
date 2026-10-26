@@ -437,3 +437,27 @@ test("trust root: only a catalog signed by the compiled-in key is accepted", () 
     (e) => e.code === "ERR_ACQ_CATALOG_UNTRUSTED",
   );
 });
+
+test("module ids that could escape the store are refused before anything is fetched or written", async () => {
+  for (const id of [
+    "../evil",
+    "a/b",
+    "a\b",
+    ".hidden",
+    "C:x",
+    "UPPER",
+    "",
+    "a".repeat(65),
+  ]) {
+    const cat = [entry("ls-ts", { id })];
+    await withEnv(async ({ root, store, source, hits }) => {
+      await assert.rejects(
+        acquire({ plan: planFor([id], cat), catalog: cat, source, store }),
+        (e) => e.code === "ERR_ACQ_BAD_ID",
+        id,
+      );
+      assert.deepEqual(hits, []);
+      assert.deepEqual(await tree(root), []);
+    });
+  }
+});

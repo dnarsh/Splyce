@@ -17,6 +17,7 @@ import { checkPlan } from "./module-plan.js";
 
 export type ModuleAcquisitionErrorCode =
   | "ERR_ACQ_STALE_PLAN"
+  | "ERR_ACQ_BAD_ID"
   | "ERR_ACQ_CUSTOM_UNACKNOWLEDGED"
   | "ERR_ACQ_OFFLINE"
   | "ERR_ACQ_FETCH"
@@ -89,6 +90,9 @@ export interface AcquireInput {
   readonly customAcknowledged?: boolean;
   readonly signal?: AbortSignal;
 }
+
+/** Lowercase letters, digits, `.`, `_`, `-`; no leading dot, so no `..`, separators or drive prefixes. */
+const MODULE_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 const sha256 = (bytes: Uint8Array): string =>
   `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -171,6 +175,15 @@ export async function acquire(input: AcquireInput): Promise<{
       "ERR_ACQ_CUSTOM_UNACKNOWLEDGED",
       "a custom source needs the user to acknowledge it before anything is fetched",
     );
+  }
+  // Module ids become path segments: refuse anything that could leave `modules/` or `staging/` before touching a store.
+  for (const entry of plan.closure) {
+    if (!MODULE_ID.test(entry.id)) {
+      throw new ModuleAcquisitionError(
+        "ERR_ACQ_BAD_ID",
+        `module id ${JSON.stringify(entry.id)} is not a safe path segment`,
+      );
+    }
   }
   const check = checkPlan(plan, catalog);
   if (!check.current) {
