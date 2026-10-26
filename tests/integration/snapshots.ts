@@ -3,8 +3,7 @@
 // unchanged HEAD with changed relevant bytes invalidates prior verifier;
 // excluded output cannot hide verifier input.
 //
-// This file is intentionally failing-first: src/snapshots.ts does not exist yet.
-// Tests describe the expected contract; implementation lands in TD-24 proper.
+// (Originally failing-first; the implementation now exists and these cases gate it.)
 
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -124,4 +123,190 @@ test("createSnapshot rejects empty directory", () => {
     (err: unknown) =>
       err instanceof SnapshotError && err.code === "EMPTY_SNAPSHOT",
   );
+});
+
+// ---- Ported from dnarsh/td24-snapshots (issue #69): real git workspaces for the gaps found in review of PR #80. ----
+import { symlinkSync, unlinkSync } from "node:fs";
+
+const sh = (dir: string, command: string) =>
+  execSync(command, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] })
+    .toString()
+    .trim();
+
+function gitRepo(files: Record<string, string>): string {
+  const dir = freshDir();
+  sh(dir, "git init -q");
+  sh(dir, "git config user.email t@example.invalid");
+  sh(dir, "git config user.name t");
+  put(dir, files);
+  sh(dir, "git add -A");
+  sh(dir, "git commit -q -m base");
+  return dir;
+}
+
+function put(dir: string, files: Record<string, string>) {
+  for (const [name, text] of Object.entries(files)) {
+    const full = join(dir, name);
+    mkdirSync(join(full, ".."), { recursive: true });
+    writeFileSync(full, text);
+  }
+}
+
+const paths = (snap: Snapshot) =>
+  [...snap.manifest.tracked, ...snap.manifest.untracked].map((e) => e.path);
+const staleCode = (error: unknown) =>
+  error instanceof SnapshotError ? error.code : undefined;
+
+test("manifest records HEAD and classifies tracked versus untracked files", () => {
+  const dir = gitRepo({ "src/a.ts": "a" });
+  put(dir, { "src/a.ts": "a-dirty", "src/new.ts": "new" });
+  const snap = createSnapshot(dir);
+  assert.equal(snap.manifest.head, sh(dir, "git rev-parse HEAD"));
+  assert.deepEqual(
+    snap.manifest.tracked.map((e) => e.path),
+    ["src/a.ts"],
+  );
+  assert.deepEqual(
+    snap.manifest.untracked.map((e) => e.path),
+    ["src/new.ts"],
+  );
+});
+
+test("a new commit is stale even when the bytes are identical", () => {
+  const dir = gitRepo({ "src/a.ts": "a" });
+  const snap = createSnapshot(dir);
+  sh(dir, "git commit -q --allow-empty -m empty");
+  assert.throws(
+    () => verifyStale(snap, dir),
+    (error) => staleCode(error) === "STALE_HEAD",
+  );
+});
+
+test("an untracked file added after verification, or a tracked file removed, invalidates it", () => {
+  const dir = gitRepo({ "src/a.ts": "a", "src/b.ts": "b" });
+  const snap = createSnapshot(dir);
+  put(dir, { "src/extra.ts": "x" });
+  assert.throws(
+    () => verifyStale(snap, dir),
+    (error) => staleCode(error) === "STALE_RELEVANT_BYTES",
+  );
+  unlinkSync(join(dir, "src/extra.ts"));
+  unlinkSync(join(dir, "src/b.ts"));
+  assert.throws(
+    () => verifyStale(snap, dir),
+    (error) => staleCode(error) === "STALE_RELEVANT_BYTES",
+  );
+});
+
+test("gitignored build output is not part of the snapshot and cannot make it stale", () => {
+  const dir = gitRepo({ ".gitignore": "dist/\n", "src/a.ts": "a" });
+  put(dir, { "dist/out.js": "built1" });
+  const snap = createSnapshot(dir);
+  assert.ok(!paths(snap).some((p) => p.startsWith("dist/")));
+  put(dir, { "dist/out.js": "built2" });
+  assert.doesNotThrow(() => verifyStale(snap, dir));
+});
+
+test("directory and suffix exclusions work and are recorded", () => {
+  const dir = gitRepo({ "src/a.ts": "a" });
+  put(dir, { "out/x.js": "1", "run.log": "1" });
+  const snap = createSnapshot(dir, { exclude: ["out/", "*.log"] });
+  assert.deepEqual(paths(snap), ["src/a.ts"]);
+  assert.deepEqual([...snap.manifest.excluded], ["out/", "*.log"]);
+  put(dir, { "out/x.js": "2", "run.log": "2" });
+  assert.doesNotThrow(() => verifyStale(snap, dir));
+});
+
+test("an exclusion can never hide a declared verifier input", () => {
+  const dir = gitRepo({ "src/a.ts": "a" });
+  put(dir, { "out/golden.json": "v1", "out/other.js": "1" });
+  const options = { exclude: ["out/"], verifierInputs: ["out/golden.json"] };
+  const snap = createSnapshot(dir, options);
+  assert.ok(paths(snap).includes("out/golden.json"));
+  assert.ok(!paths(snap).includes("out/other.js"));
+  put(dir, { "out/other.js": "2" });
+  assert.doesNotThrow(() => verifyStale(snap, dir));
+  put(dir, { "out/golden.json": "v2" });
+  assert.throws(
+    () => verifyStale(snap, dir),
+    (error) => staleCode(error) === "STALE_RELEVANT_BYTES",
+  );
+});
+
+test("excluding a path that is also a verifier input still captures it", () => {
+  const dir = gitRepo({ "src/a.ts": "a" });
+  const snap = createSnapshot(dir, {
+    exclude: ["src/a.ts"],
+    verifierInputs: ["src/a.ts"],
+  });
+  assert.ok(paths(snap).includes("src/a.ts"));
+});
+
+test("a gitignored verifier input is captured and a missing one is recorded as absent", () => {
+  const dir = gitRepo({ ".gitignore": "fixture.txt\n", "src/a.ts": "a" });
+  put(dir, { "fixture.txt": "one" });
+  const options = { verifierInputs: ["fixture.txt", "never.txt"] };
+  const snap = createSnapshot(dir, options);
+  const digests = new Map(
+    [...snap.manifest.tracked, ...snap.manifest.untracked].map((e) => [
+      e.path,
+      e.sha256,
+    ]),
+  );
+  assert.notEqual(digests.get("fixture.txt"), "absent");
+  assert.equal(digests.get("never.txt"), "absent");
+  put(dir, { "never.txt": "now present" });
+  assert.throws(
+    () => verifyStale(snap, dir),
+    (error) => staleCode(error) === "STALE_RELEVANT_BYTES",
+  );
+});
+
+test("verifier-input paths that escape the workspace are rejected", () => {
+  const dir = gitRepo({ "src/a.ts": "a" });
+  assert.throws(
+    () => createSnapshot(dir, { verifierInputs: ["../outside.txt"] }),
+    (error) => staleCode(error) === "PATH_ESCAPE",
+  );
+});
+
+test("a symlink is bound by its link text, never by its target's bytes", (t) => {
+  const dir = gitRepo({ "src/a.ts": "a" });
+  const outside = freshDir();
+  writeFileSync(join(outside, "secret.txt"), "one");
+  try {
+    symlinkSync(join(outside, "secret.txt"), join(dir, "link.txt"));
+  } catch {
+    t.skip("symlink creation not permitted on this host");
+    return;
+  }
+  const snap = createSnapshot(dir);
+  writeFileSync(join(outside, "secret.txt"), "two");
+  assert.doesNotThrow(() => verifyStale(snap, dir));
+});
+
+test("outside git the head is none and file changes still invalidate", () => {
+  const dir = freshDir();
+  writeFileSync(join(dir, "a.ts"), "a");
+  const snap = createSnapshot(dir);
+  assert.equal(snap.manifest.head, "none");
+  writeFileSync(join(dir, "a.ts"), "b");
+  assert.throws(
+    () => verifyStale(snap, dir),
+    (error) => staleCode(error) === "STALE_RELEVANT_BYTES",
+  );
+});
+
+test("the whole manifest is deeply immutable", () => {
+  const dir = gitRepo({ "src/a.ts": "a" });
+  const snap = createSnapshot(dir);
+  assert.throws(() => {
+    (snap.manifest.tracked as unknown as { path: string }[])[0]!.path = "x";
+  }, TypeError);
+  assert.throws(() => {
+    (snap.manifest as unknown as { head: string }).head = "x";
+  }, TypeError);
+  assert.throws(() => {
+    (snap.manifest.untracked as unknown as unknown[]).push({});
+  }, TypeError);
 });
