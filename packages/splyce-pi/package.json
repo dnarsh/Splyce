@@ -11,6 +11,10 @@
     "./module-plan": {
       "types": "./dist/module-plan.d.ts",
       "import": "./dist/module-plan.js"
+    },
+    "./module-acquisition": {
+      "types": "./dist/module-acquisition.d.ts",
+      "import": "./dist/module-acquisition.js"
     }
   },
   "files": [
