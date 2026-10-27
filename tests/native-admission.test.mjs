@@ -558,17 +558,28 @@ test("terminal parent cannot authorize a nested action through its old intent", 
   const f = await fixture(t);
   await runToolCall(f.call, f.options);
   await writeFile(f.canary, "after-parent");
+  // Isolate parent state from the earlier rejection of consumed grants.
+  f.policy.authorize({
+    ...f.permit,
+    toolCallId: "terminal-parent",
+    grantId: f.grant(f.permit.actionId),
+  });
+  assert.doesNotThrow(
+    () => f.policy.check("terminal-parent", f.permit.toolName, undefined),
+    "the terminal-parent fixture has a currently valid Store grant",
+  );
   f.policy.authorize({
     ...f.permit,
     toolCallId: "child",
     actionId: "child-action",
+    grantId: f.grant("child-action"),
     idempotencyKey: "child-effect",
     parentActionId: "a1",
   });
   await assert.rejects(
     runToolCall(
       { ...f.call, id: "child" },
-      { ...f.options, parentToolCallId: f.call.id },
+      { ...f.options, parentToolCallId: "terminal-parent" },
     ),
     {
       code: "PARENT_NOT_RUNNING",
@@ -698,6 +709,7 @@ for (const mismatch of [
       ...f.permit,
       toolCallId: "child",
       actionId: "child-action",
+      grantId: f.grant("child-action"),
       idempotencyKey: "child-effect",
       parentActionId: mismatch === "root" ? null : f.permit.actionId,
     });
