@@ -223,6 +223,61 @@ test("a very long non-failure line is cut to its two ends, a long failure line i
   );
 });
 
+test("a failure frame before the last carriage-return frame is kept", () => {
+  const text = [
+    "error: ENOENT: no such file\rretrying 1/3\rretrying 2/3",
+    "FAILED case one\r2 passed",
+    ...n(400, (i) => `step ${String(i)} ok`),
+  ].join("\n");
+  const out = compact(text, 1024);
+  assert.ok(out.text.includes("error: ENOENT: no such file"), out.text);
+  assert.ok(out.text.includes("FAILED case one"), out.text);
+  assert.ok(size(out.text) <= 1024);
+  assert.equal(compact(out.text, 1024).text, out.text, "idempotent");
+});
+
+test("warning lines without a colon are kept", () => {
+  const text = [
+    ...n(600, (i) => `ordinary output ${String(i)}`),
+    "WARNING TS1234: 'x' is declared but never used",
+    "WARN deprecated old-package",
+    ...n(600, (i) => `later output ${String(i)}`),
+  ].join("\n");
+  const out = compact(text, 1024);
+  assert.ok(
+    out.text.includes("WARNING TS1234: 'x' is declared but never used"),
+    out.text,
+  );
+  assert.ok(out.text.includes("WARN deprecated old-package"), out.text);
+  assert.ok(size(out.text) <= 1024);
+  assert.equal(compact(out.text, 1024).text, out.text, "idempotent");
+});
+
+test("an explicit budget below the short-output threshold still bounds the output", () => {
+  const text = n(20, (i) => `line ${String(i)} ${"x".repeat(20)}`).join("\n");
+  assert.ok(size(text) > 128 && size(text) < 1024);
+  const out = compact(text, 128);
+  assert.ok(size(out.text) <= 128, `${String(size(out.text))} > 128`);
+  assert.equal(out.lossy, true);
+  assert.equal(compact(out.text, 128).text, out.text, "idempotent");
+});
+
+test("ordinary lines that look like compaction markers still fit the budget", () => {
+  const text = n(
+    300,
+    (i) => `[output truncated] payload ${String(i)} ${"p".repeat(40)}`,
+  ).join("\n");
+  assert.ok(size(text) > 8192);
+  const out = compact(text);
+  assert.ok(size(out.text) <= 8192, `${String(size(out.text))} > 8192`);
+  assert.equal(compact(out.text).text, out.text, "idempotent");
+  const long = `[output truncated] ${"q".repeat(15000)}`;
+  const one = compact(
+    `${long}\n${n(100, (i) => `pad ${String(i)}`).join("\n")}`,
+  );
+  assert.ok(size(one.text) <= 8192, `${String(size(one.text))} > 8192`);
+});
+
 test("a noisy-line summary is kept when the rest of the output is elided", () => {
   const text = [
     ...n(1500, (i) => `ordinary line ${String(i)}`),

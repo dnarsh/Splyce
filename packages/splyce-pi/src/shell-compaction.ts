@@ -11,10 +11,13 @@ const MARKER_BYTES = 48;
 const ANSI =
   /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-Z\\-_])/g;
 // Kept in every case, wherever it sits in the output.
-const SIGNAL = /error|fail|panic|exception|traceback|warning: |✖|FAILED/i;
-// Lines this module or the shell tool wrote to mark a cut; kept so compaction is idempotent.
+const SIGNAL =
+  /error|fail|panic|exception|traceback|\bwarn(?:ing)?s?\b|✖|FAILED/i;
+// Lines this module wrote to mark a cut; kept so compaction is idempotent.
+// Anchored and short: ordinary output that merely starts like a marker is not one.
 const MARKER =
-  /^\[(?:… \d+ lines elided\]|\d+ [a-z-]+ lines: |output truncated\])/;
+  /^\[(?:… \d+ lines elided|\d+ [a-z-]+ lines: .*|output truncated)\]$/;
+const marker = (l: string) => l.length <= 200 && MARKER.test(l);
 const NOISE: readonly (readonly [string, RegExp])[] = [
   [
     "passing-test",
@@ -31,7 +34,7 @@ const NOISE: readonly (readonly [string, RegExp])[] = [
 ];
 const enc = new TextEncoder();
 const bytes = (s: string) => enc.encode(s).length;
-const pinned = (l: string) => SIGNAL.test(l) || MARKER.test(l);
+const pinned = (l: string) => SIGNAL.test(l) || marker(l);
 const clip = (s: string) => {
   const t = s.trim();
   return t.length > 60 ? `${t.slice(0, 60)}…` : t;
@@ -47,10 +50,14 @@ export function compact(
     .replace(ANSI, "")
     .replace(/\r\n/g, "\n")
     .split("\n")
-    .map((l) =>
-      l.includes("\r") ? (l.split("\r").filter(Boolean).pop() ?? "") : l,
-    );
-  if (bytes(cleaned.join("\n")) <= SHORT)
+    .flatMap((l) => {
+      if (!l.includes("\r")) return [l];
+      // A frame that looks like a failure is kept; the last frame is the live one.
+      const frames = l.split("\r").filter(Boolean);
+      const last = frames.pop() ?? "";
+      return [...frames.filter((f) => f !== last && SIGNAL.test(f)), last];
+    });
+  if (bytes(cleaned.join("\n")) <= Math.min(SHORT, budget))
     return { text: cleaned.join("\n"), lossy: false };
 
   let lossy = false;
