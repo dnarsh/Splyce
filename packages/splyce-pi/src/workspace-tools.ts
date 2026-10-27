@@ -712,7 +712,7 @@ export function createWorkspaceTools(
       const c = compact(r.text, compactBytes);
       return {
         ...done(
-          c.text + tail,
+          scrub(c.text + tail) ?? "[output withheld: redaction failed]",
           started,
           r.bytes,
           r.truncated || c.lossy,

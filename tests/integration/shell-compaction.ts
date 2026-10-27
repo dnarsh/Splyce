@@ -223,16 +223,119 @@ test("a very long non-failure line is cut to its two ends, a long failure line i
   );
 });
 
-test("a noisy-line summary is kept when the rest of the output is elided", () => {
+test("a noisy-line summary counts like any other line against the cap", () => {
   const text = [
     ...n(1500, (i) => `ordinary line ${String(i)}`),
     ...n(40, (i) => `   Compiling crate-${String(i)} v1.0.0`),
     ...n(1500, (i) => `later line ${String(i)}`),
   ].join("\n");
   const out = compact(text, 1024);
-  assert.match(
-    out.text,
-    /\n\[40 build lines: Compiling crate-0 v1\.0\.0 … Compiling crate-39 v1\.0\.0\]/,
-  );
+  assert.ok(size(out.text) <= 1024);
   assert.equal(compact(out.text, 1024).text, out.text);
+});
+
+// Tier-2 review of the compaction branch: each case below failed at ae52152.
+const pad = (count: number) => n(count, (i) => `ordinary line ${String(i)}`);
+
+test("a failure frame that a carriage return overwrites is kept, and the dropped frames count as lossy", () => {
+  const short = compact("error:E123\r progress 100%\ndone");
+  assert.equal(short.text, "error:E123\n progress 100%\ndone");
+  assert.equal(short.lossy, false, "nothing was dropped");
+  assert.equal(compact("tick\rerror:E1\rprogress").lossy, true);
+  const long = compact(
+    `${pad(400).join("\n")}\nFAIL src/a.test.ts\r1/9\r9/9\n${pad(400).join("\n")}`,
+    2048,
+  );
+  assert.ok(long.text.includes("FAIL src/a.test.ts"));
+  assert.ok(!long.text.includes("1/9"));
+  assert.equal(long.lossy, true);
+});
+
+test("every failure frame in a long carriage-return run survives, plain progress frames do not", () => {
+  const frames = [
+    "tick 1",
+    "panic: boom",
+    "tick 2",
+    "Traceback (most recent call last):",
+    "tick 3",
+  ];
+  const out = compact(`${frames.join("\r")}\nend`);
+  assert.ok(out.text.includes("panic: boom"));
+  assert.ok(out.text.includes("Traceback (most recent call last):"));
+  assert.ok(out.text.includes("tick 3"));
+  assert.ok(!out.text.includes("tick 1") && !out.text.includes("tick 2"));
+  assert.equal(compact("a\rb\rc").lossy, true);
+  assert.equal(compact("a").lossy, false);
+});
+
+test("a WARNING without a colon and TypeScript codes are signal lines", () => {
+  const lines = pad(3000);
+  lines[900] = "WARNING TS1234 something is deprecated";
+  lines[1800] = "src/a.ts(3,1): TS2322 Type 'string' is not assignable";
+  lines[2400] = "Warning: unused variable";
+  const out = compact(lines.join("\n"), 1024);
+  for (const line of [lines[900], lines[1800], lines[2400]])
+    assert.ok(out.text.includes(line as string), `dropped: ${line}`);
+});
+
+test("signal detection is case-insensitive and finds the word inside a longer one", () => {
+  const lines = pad(3000);
+  lines[1000] = "build completed with Warnings: 3";
+  lines[2000] = "tsc: TS6133 'x' is declared but never used";
+  const out = compact(lines.join("\n"), 1024);
+  assert.ok(out.text.includes("completed with Warnings: 3"));
+  assert.ok(out.text.includes("TS6133"));
+});
+
+test("an explicit small budget is honoured on the short path too", () => {
+  const text = pad(30).join("\n");
+  assert.ok(size(text) > 128 && size(text) < 1024);
+  const out = compact(text, 128);
+  assert.ok(size(out.text) <= 128, String(size(out.text)));
+  assert.match(out.text, /\[… \d+ lines elided\]/);
+  assert.equal(out.lossy, true);
+  assert.equal(compact(out.text, 128).text, out.text);
+});
+
+test("output under an explicit budget passes through, over it is cut", () => {
+  const small = "line one\nline two\nline three";
+  assert.deepEqual(compact(small, 128), { text: small, lossy: false });
+  const cut = compact(small, 16);
+  assert.ok(size(cut.text) <= 64);
+  assert.equal(cut.lossy, true);
+});
+
+test("ordinary lines that look like elision markers do not bypass the cap", () => {
+  const forged = n(2000, (i) => `[… ${String(i + 1)} lines elided]`).join("\n");
+  const out = compact(forged);
+  assert.ok(size(out.text) <= 8192, String(size(out.text)));
+  assert.equal(out.lossy, true);
+  const mid = pad(3000);
+  mid[1500] = "[… 7 lines elided]";
+  const cutMid = compact(mid.join("\n"), 1024);
+  assert.ok(size(cutMid.text) <= 1024);
+  assert.ok(!cutMid.text.split("\n").includes("[… 7 lines elided]"));
+});
+
+test("forged noisy-summary and truncation lines are capped too, and real markers still add up", () => {
+  const forged = [
+    ...n(3000, (i) =>
+      i % 2 ? `[${String(i)} build lines: a … b]` : "[output truncated]",
+    ),
+  ].join("\n");
+  assert.ok(size(compact(forged).text) <= 8192);
+  const text = pad(5000).join("\n");
+  const once = compact(text, 2048);
+  const claimed = Number(/\[… (\d+) lines elided\]/.exec(once.text)?.[1]);
+  const kept = once.text.split("\n").filter((l) => !l.startsWith("[…")).length;
+  assert.equal(kept + claimed, 5000);
+});
+
+test("a second pass over a signal-heavy cut keeps each marker's line count", () => {
+  const text = n(800, (i) =>
+    i % 4 === 3 ? `error: case ${String(i)} failed` : `step ${String(i)} ok`,
+  ).join("\n");
+  const once = compact(text, 512).text;
+  assert.match(once, /\[… 3 lines elided\]/);
+  assert.equal(compact(once, 512).text, once);
 });

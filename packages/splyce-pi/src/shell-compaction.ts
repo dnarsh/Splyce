@@ -4,17 +4,15 @@
 // is never dropped. Pure: the caller keeps the raw text.
 
 export const COMPACT_BYTES = 8 * 1024;
-// Output at or under this size is returned as is (after ANSI and CR cleanup).
+// Output at or under this size (and under the budget) is returned as is, after ANSI and CR cleanup.
 const SHORT = 1024;
 const LONG_LINE = 1200;
 const MARKER_BYTES = 48;
 const ANSI =
   /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-Z\\-_])/g;
-// Kept in every case, wherever it sits in the output.
-const SIGNAL = /error|fail|panic|exception|traceback|warning: |✖|FAILED/i;
-// Lines this module or the shell tool wrote to mark a cut; kept so compaction is idempotent.
-const MARKER =
-  /^\[(?:… \d+ lines elided\]|\d+ [a-z-]+ lines: |output truncated\])/;
+// Kept in every case, wherever it sits in the output. Nothing else is exempt from the budget.
+const SIGNAL = /error|fail|panic|exception|traceback|warning|✖|\bTS\d{3,5}\b/i;
+const ELIDED = /^\[… (\d+) lines elided\]$/;
 const NOISE: readonly (readonly [string, RegExp])[] = [
   [
     "passing-test",
@@ -31,7 +29,13 @@ const NOISE: readonly (readonly [string, RegExp])[] = [
 ];
 const enc = new TextEncoder();
 const bytes = (s: string) => enc.encode(s).length;
-const pinned = (l: string) => SIGNAL.test(l) || MARKER.test(l);
+const pinned = (l: string) => SIGNAL.test(l);
+// An elision marker stands for the lines it replaced, so a second pass keeps the count.
+// A line that merely looks like one is an ordinary line and may be cut like any other.
+const weight = (l: string) => {
+  const n = Number(ELIDED.exec(l)?.[1] ?? 1);
+  return Number.isSafeInteger(n) && n > 0 ? n : 1;
+};
 const clip = (s: string) => {
   const t = s.trim();
   return t.length > 60 ? `${t.slice(0, 60)}…` : t;
@@ -43,17 +47,24 @@ export function compact(
   raw: string,
   budget = COMPACT_BYTES,
 ): { text: string; lossy: boolean } {
-  const cleaned = raw
-    .replace(ANSI, "")
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((l) =>
-      l.includes("\r") ? (l.split("\r").filter(Boolean).pop() ?? "") : l,
-    );
-  if (bytes(cleaned.join("\n")) <= SHORT)
-    return { text: cleaned.join("\n"), lossy: false };
-
   let lossy = false;
+  // Carriage-return progress keeps its last frame; an earlier failure frame is kept as its own line.
+  const cleaned: string[] = [];
+  for (const l of raw.replace(ANSI, "").replace(/\r\n/g, "\n").split("\n")) {
+    if (!l.includes("\r")) {
+      cleaned.push(l);
+      continue;
+    }
+    const frames = l.split("\r").filter(Boolean);
+    const last = frames.pop() ?? "";
+    for (const f of frames)
+      if (pinned(f)) cleaned.push(f);
+      else lossy = true;
+    cleaned.push(last);
+  }
+  if (bytes(cleaned.join("\n")) <= Math.min(SHORT, budget))
+    return { text: cleaned.join("\n"), lossy };
+
   // 1. Repeated consecutive lines become one line with a count; blank runs shrink to one.
   const folded: string[] = [];
   for (let i = 0; i < cleaned.length;) {
@@ -124,10 +135,10 @@ export function compact(
   for (let i = 0; i < grouped.length;) {
     if (kept[i]) text.push(grouped[i++] as string);
     else {
-      let j = i;
-      while (j < grouped.length && !kept[j]) j++;
-      text.push(`[… ${String(j - i)} lines elided]`);
-      i = j;
+      let cut = 0;
+      for (; i < grouped.length && !kept[i]; i++)
+        cut += weight(grouped[i] as string);
+      text.push(`[… ${String(cut)} lines elided]`);
     }
   }
   return { text: text.join("\n"), lossy: true };

@@ -1310,3 +1310,38 @@ test("compaction does not change what the child can see: secret env never reache
     delete process.env.SPLYCE_TEST_API_KEY;
   }
 });
+
+test("the compacted shell text is redacted too; raw stays the caller's, and a failing redactor withholds the text", async () => {
+  const cmd = win ? "Get-Content .env" : "cat .env";
+  const h = harness();
+  dotenv(h);
+  approveSh(h, cmd);
+  const r = (await (
+    h.tools[sh] as {
+      result(
+        a: object,
+      ): Promise<{ text: string; raw: string; summary: Summary }>;
+    }
+  ).result({ command: cmd })) as {
+    text: string;
+    raw: string;
+    summary: Summary;
+  };
+  clean(r.text, "shell text");
+  clean(r.summary.preview, "shell preview");
+  assert.match(r.text, /harmless=value/);
+  assert.match(r.raw, /hunter2/);
+  const bad = harness(undefined, () => {
+    throw new Error("down");
+  });
+  dotenv(bad);
+  approveSh(bad, cmd);
+  const w = (await (
+    bad.tools[sh] as {
+      result(a: object): Promise<{ text: string; summary: Summary }>;
+    }
+  ).result({ command: cmd })) as { text: string; summary: Summary };
+  assert.match(w.text, /withheld/);
+  clean(w.text, "withheld text");
+  assert.equal("preview" in w.summary, false);
+});
