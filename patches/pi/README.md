@@ -233,5 +233,6 @@ settlement. They provide no cross-process atomic writer guarantee. The earlier
 97-case result and unqualified 56-case vendor fixture remain recorded; current
 15-case source and 8-case SDK component checks pass. The complete registered
 scripts pass 110/110 at the frozen source, with zero failures, skips or
-cancellations. The new full vendor check remains pending. This patch activates
+cancellations. The full vendor check also passes at the final source bytes, with
+no Biome fixes. This patch activates
 no provider or grant.

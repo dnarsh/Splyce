@@ -196,8 +196,10 @@ with zero failures, skips or cancellations:
 - `npm run test:native-owned-session`: 71/71 in 99582.4549 ms.
 - `npm run test:native-persistence`: 24/24 compiled cases in 22890.8813 ms, then 15/15 source cases in 7255.7544 ms.
 
-The complete vendor `npm run check` has not yet been rerun after these review
-fixes; its earlier intermediate-source pass does not qualify the current source.
+The complete vendor `npm run check` also passed at these final source bytes:
+Biome checked 1,578 files with no fixes, followed by pinned/runtime dependencies,
+TypeScript import forms, entry graphs, install-lock comparison, TypeScript 7
+and browser smoke. The earlier failures remain recorded above.
 
 Local fixtures and canonical source replay do not establish live Rust inventory,
 complete native composition, installed Windows behavior, actual provider access,
