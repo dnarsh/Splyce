@@ -104,7 +104,8 @@ export interface ToolSummary {
   durationMs: number;
   bytes: number;
   truncated: boolean;
-  preview: string;
+  /** Redacted; absent when redaction failed. */
+  preview?: string;
 }
 export interface ToolResult {
   text: string;
@@ -135,6 +136,8 @@ export interface WorkspaceToolsOptions {
   receipts: ReceiptPort;
   sessionId: string;
   workspaceId: string;
+  /** Extra redactor (the resolver's), applied after the built-in scrub to previews and error messages. */
+  redact?: (text: string) => string;
   limits?: { timeoutMs: number; maxOutputBytes: number };
 }
 
@@ -166,6 +169,36 @@ const MAX_GREP_SCAN_BYTES = 8 << 20;
 const MAX_GREP_LINE = 4096;
 // shortcut: flat check only; overlapping alternation like (a|aa)+ is not caught, the scan budget bounds it.
 const NESTED_QUANTIFIER = /\([^()]*(?:[+*]|\{\d+,\})[^()]*\)(?:[+*]|\{\d+,\})/;
+
+// Same shapes as redactSecrets in splyce-retrieval; kept local so this package takes no dependency.
+const SECRET_PATTERNS: Array<[RegExp, string]> = [
+  [
+    /-----BEGIN [A-Z ]{0,40}KEY-----[\s\S]*?(?:-----END [A-Z ]{0,40}KEY-----|$)/g,
+    "[REDACTED]",
+  ],
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]"],
+  [
+    /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
+    "[REDACTED]",
+  ],
+  [/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, "[REDACTED]"],
+  [/\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}/g, "[REDACTED]"],
+  [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, "[REDACTED]"],
+  [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, "[REDACTED]"],
+  [/\bxox[abposr]-[A-Za-z0-9-]{8,}/g, "[REDACTED]"],
+  [/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "[REDACTED]"],
+  [
+    // No `.` in the key: `token.ts: summary` is a file path, not a credential.
+    /\b([A-Za-z0-9_-]{0,40}(?:key|secret|token|password|passwd|pwd)[A-Za-z0-9_-]{0,40})(\s{0,4}[:=]\s{0,4})("[^"\n]{0,512}"|'[^'\n]{0,512}'|[^\s,;&]+)/gi,
+    "$1$2[REDACTED]",
+  ],
+];
+export function redactSecrets(text: string): string {
+  let out = text;
+  for (const [pattern, replacement] of SECRET_PATTERNS)
+    out = out.replace(pattern, replacement);
+  return out;
+}
 
 const fail = (code: ErrorCode, message: string): never => {
   throw new WorkspaceToolError(code, message);
@@ -489,6 +522,19 @@ export function createWorkspaceTools(
   }
 
   const PREVIEW = 2048;
+  // Built-in scrub first, then the injected redactor; undefined if either throws, so nothing raw is shown.
+  const scrub = (text: string): string | undefined => {
+    try {
+      const clean = redactSecrets(text);
+      return opts.redact ? opts.redact(clean) : clean;
+    } catch {
+      return undefined;
+    }
+  };
+  const preview = (text: string) => {
+    const p = scrub(text.slice(0, PREVIEW * 2))?.slice(0, PREVIEW);
+    return p === undefined ? {} : { preview: p };
+  };
   const done = (
     text: string,
     started: number,
@@ -502,7 +548,7 @@ export function createWorkspaceTools(
       durationMs: Date.now() - started,
       bytes,
       truncated,
-      preview: text.slice(0, PREVIEW),
+      ...preview(text),
     },
   });
   const lines = (text: string, started: number, more: string) => {
@@ -972,10 +1018,30 @@ export function createWorkspaceTools(
     shell("bash", "bash"),
     shell("powershell", "PowerShell"),
   ];
+  // Error messages can quote a command or path; they pass through the same scrub.
+  const result =
+    (t: Impl): WorkspaceTool["result"] =>
+    async (...a) => {
+      try {
+        return await t.result(...a);
+      } catch (e) {
+        throw e instanceof WorkspaceToolError
+          ? new WorkspaceToolError(
+              e.code,
+              scrub(e.message) ?? e.code,
+              e.summary,
+            )
+          : e;
+      }
+    };
   return Object.fromEntries(
     tools.map((t) => [
       t.name,
-      { ...t, execute: async (...a) => (await t.result(...a)).text },
+      {
+        ...t,
+        result: result(t),
+        execute: async (...a) => (await result(t)(...a)).text,
+      },
     ]),
   );
 }

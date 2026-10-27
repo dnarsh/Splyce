@@ -16,7 +16,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { cpus, tmpdir } from "node:os";
+import { Worker } from "node:worker_threads";
 import { join } from "node:path";
 import test from "node:test";
 import {
@@ -40,7 +41,10 @@ interface Grant {
   revoked?: boolean;
 }
 
-function harness(limits?: { timeoutMs?: number; maxOutputBytes?: number }) {
+function harness(
+  limits?: { timeoutMs?: number; maxOutputBytes?: number },
+  redact?: (text: string) => string,
+) {
   const dir = mkdtempSync(join(base, "case-"));
   const root = join(dir, "root");
   const outside = join(dir, "outside");
@@ -99,11 +103,12 @@ function harness(limits?: { timeoutMs?: number; maxOutputBytes?: number }) {
     receipts,
     sessionId: "s1",
     workspaceId: "w1",
+    ...(redact ? { redact } : {}),
     ...(limits
       ? { limits: { timeoutMs: 20000, maxOutputBytes: 1 << 20, ...limits } }
       : {}),
   });
-  return { root, outside, ws, grants, log, tools, receipts };
+  return { root, outside, ws, grants, log, tools, receipts, workspaces };
 }
 type H = ReturnType<typeof harness>;
 const run = (h: H, name: string, args: object) =>
@@ -752,7 +757,7 @@ type Summary = {
   durationMs: number;
   bytes: number;
   truncated: boolean;
-  preview: string;
+  preview?: string;
 };
 const result = (h: H, name: string, args: object) =>
   (
@@ -1036,4 +1041,188 @@ test("more windows device spellings are denied", winOnly, async () => {
     "CONOUT$",
     "sub/conin$.x",
   ]);
+});
+
+// Redaction: nothing that looks like a credential may reach summary.preview
+// (ledger and renderer) or an error message, whatever tool produced it.
+const PLANTED = [
+  "OPENAI_API_KEY=sk-proj-abcdefghijklmnop1234567890",
+  "password=hunter2",
+  "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123",
+  "GH=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+  "AWS=AKIAABCDEFGHIJKLMNOP",
+  "SLACK=xoxb-123456789012-abcdefghij",
+  "JWT=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop",
+  "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----",
+  "harmless=value",
+].join("\n");
+const SECRETS = [
+  "sk-proj-abcdefghijklmnop",
+  "hunter2",
+  "abcdefghijklmnopqrstuvwxyz0123",
+  "ghp_abcdefgh",
+  "AKIAABCDEFGHIJKLMNOP",
+  "xoxb-123456789012",
+  "eyJhbGciOiJIUzI1NiJ9",
+  "MIIEvQIBADANBgkqhkiG9w0",
+];
+const clean = (s: string | undefined, what: string) => {
+  assert.equal(typeof s, "string", what);
+  for (const secret of SECRETS)
+    assert.ok(!s?.includes(secret), `${what} leaked ${secret}`);
+};
+const dotenv = (h: H) => writeFileSync(join(h.root, ".env"), PLANTED);
+
+test("a planted .env is redacted in the preview of read, grep and shell output", async () => {
+  const h = harness();
+  dotenv(h);
+  const read = await result(h, "read", { path: ".env" });
+  clean(read.summary.preview, "read preview");
+  assert.match(read.summary.preview ?? "", /OPENAI_API_KEY=\[REDACTED\]/);
+  assert.match(read.summary.preview ?? "", /harmless=value/);
+  assert.match(
+    read.text,
+    /hunter2/,
+    "the model's own read text is not rewritten",
+  );
+  const grep = await result(h, "grep", { pattern: "=" });
+  clean(grep.summary.preview, "grep preview");
+  assert.match(grep.summary.preview ?? "", /harmless=value/);
+  const cmd = win ? "Get-Content .env" : "cat .env";
+  approveSh(h, cmd);
+  const shell = await result(h, sh, { command: cmd });
+  clean(shell.summary.preview, "shell preview");
+  assert.match(shell.summary.preview ?? "", /harmless=value/);
+});
+
+test("a secret that straddles the 2048-character preview edge is still redacted", async () => {
+  const h = harness();
+  writeFileSync(
+    join(h.root, "edge.txt"),
+    `${"x".repeat(2030)}\npassword=hunter2`,
+  );
+  const r = await result(h, "read", { path: "edge.txt" });
+  assert.ok(!(r.summary.preview ?? "").includes("hunter"));
+  assert.ok((r.summary.preview ?? "").length <= 2048);
+});
+
+test("the injected redactor runs after the built-in scrub and a redactor that throws omits the preview", async () => {
+  const seen: string[] = [];
+  const h = harness(undefined, (text) => {
+    seen.push(text);
+    return text.replace(/harmless/g, "[HIDDEN]");
+  });
+  dotenv(h);
+  const r = await result(h, "read", { path: ".env" });
+  assert.match(r.summary.preview ?? "", /\[HIDDEN\]=value/);
+  clean(r.summary.preview, "preview");
+  clean(seen.join("\n"), "text handed to the injected redactor");
+  const bad = harness(undefined, () => {
+    throw new Error("redactor down");
+  });
+  dotenv(bad);
+  const out = await result(bad, "read", { path: ".env" });
+  assert.equal("preview" in out.summary, false);
+  assert.ok(!JSON.stringify(out.summary).includes("hunter2"));
+  assert.equal(out.summary.bytes, Buffer.byteLength(PLANTED));
+});
+
+test("error messages never carry a secret from the command or path, even when the redactor throws", async () => {
+  const cmd = `echo Bearer abcdefghijklmnopqrstuvwxyz0123 password=hunter2`;
+  for (const redact of [
+    undefined,
+    () => {
+      throw new Error("down");
+    },
+  ]) {
+    const h = harness(undefined, redact);
+    const err = await run(h, sh, { command: cmd }).then(
+      () => undefined,
+      (e: { code?: string; message: string }) => e,
+    );
+    assert.equal(err?.code, "GRANT_REQUIRED");
+    clean(err.message, "error message");
+  }
+});
+
+// Fix-forward on the #155 re-review.
+test("the grep worker really exits after the budget: no CPU is burned once the call has failed", async () => {
+  const h = harness();
+  writeFileSync(join(h.root, "a.txt"), `${"a".repeat(40)}!`);
+  assert.ok(
+    GREP_STOPPED.includes(
+      await codeOf(run(h, "grep", { pattern: "(a|aa)+$" })),
+    ),
+  );
+  const before = process.cpuUsage();
+  await new Promise((r) => setTimeout(r, 1200));
+  const used = process.cpuUsage(before);
+  assert.ok(
+    (used.user + used.system) / 1000 < 500,
+    `${String((used.user + used.system) / 1000)}ms of CPU in 1.2s idle`,
+  );
+});
+
+test("a directory swapped for a junction after the first mkdir is caught before the next one", async () => {
+  const h = harness();
+  mkdirSync(join(h.root, "sub"));
+  mkdirSync(join(h.outside, "a"));
+  h.grants.approve("fs.write", "sub/a/b/f.txt");
+  const workspace = h.workspaces.workspace.bind(h.workspaces);
+  let swapped = false;
+  h.workspaces.workspace = (id) => {
+    if (!swapped && existsSync(join(h.root, "sub", "a"))) {
+      swapped = true;
+      rmSync(join(h.root, "sub"), { recursive: true });
+      symlinkSync(h.outside, join(h.root, "sub"), "junction");
+    }
+    return workspace(id);
+  };
+  assert.equal(
+    await codeOf(run(h, "write", { path: "sub/a/b/f.txt", content: "x" })),
+    "WORKSPACE_ESCAPE",
+  );
+  assert.ok(swapped, "the swap must have happened after the first mkdir");
+  assert.deepEqual(readdirSync(join(h.outside, "a")), []);
+});
+
+test("edit on a file with mixed line endings matches exactly and leaves the other lines alone", async () => {
+  const h = harness();
+  const file = join(h.root, "m.txt");
+  writeFileSync(file, "a\r\nb\nc\r\n");
+  h.grants.approve("fs.write", "m.txt");
+  await run(h, "edit", {
+    path: "m.txt",
+    edits: [{ oldText: "b", newText: "B" }],
+  });
+  assert.equal(readFileSync(file, "utf8"), "a\r\nB\nc\r\n");
+  h.grants.approve("fs.write", "m.txt");
+  assert.equal(
+    await codeOf(
+      run(h, "edit", {
+        path: "m.txt",
+        edits: [{ oldText: "a\nB", newText: "x" }],
+      }),
+    ),
+    "EDIT_NOT_FOUND",
+  );
+  assert.equal(readFileSync(file, "utf8"), "a\r\nB\nc\r\n");
+});
+
+test("worker start-up time does not count against the grep budget, even with every core busy", async () => {
+  const h = harness();
+  writeFileSync(join(h.root, "a.txt"), "needle");
+  const burners = Array.from(
+    { length: cpus().length * 2 },
+    () => new Worker("while (true) {}", { eval: true }),
+  );
+  try {
+    for (let i = 0; i < 4; i++)
+      assert.match(
+        String(await run(h, "grep", { pattern: "needle" })),
+        /a\.txt:1:needle/,
+      );
+  } finally {
+    await Promise.all(burners.map((b) => b.terminate()));
+  }
 });

@@ -203,6 +203,14 @@ export type SplyceEngineEvent =
       status: "success" | "error" | "uncertain";
       outcomeRef?: string;
       error?: string;
+      /** Optional and strict: unknown keys, a preview over 2048 chars, negative or non-integer numbers are rejected. `bytes` is the raw output size; `preview` is already redacted. */
+      summary?: {
+        exitCode?: number | null;
+        durationMs?: number;
+        bytes?: number;
+        truncated?: boolean;
+        preview?: string;
+      };
     }
   | {
       kind: "turn.completed";
