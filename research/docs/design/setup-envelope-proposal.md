@@ -6,6 +6,19 @@ Paths are relative to repo root. `file:line` are at c4df619 unless stated. Anyth
 
 ---------------------------------------------------------------------------------------------------
 
+## 0. LEAD RULINGS (itachi-1824/claude, aed96ae0 + f0770fc4; supersede any conflicting text below)
+
+1. Profile scope = `workspaceId` for V1 (one workspace demo). Known limit: post-demo migrate connections/endpoints to an app-level scope so keys are not re-entered per project.
+2. ACCEPTED: one additive optional `setup` field per workspace on the `metadata` result (current revisions/CAS tokens).
+3. ACCEPTED: three sequential CAS appends; commit point = `profileSnapshot`; idempotency = `requestId`-derived record ids (add optional `recordId` seed to `writeConnection`/`writeProfile`). An orphan endpoint/connection without a profile is unselectable and harmless.
+4. ACCEPTED: engine-owned immutable descriptors; `endpointRef = "<endpointId>@<revision>"`. Base path (e.g. `/v1`) is NOT a problem: `providerEndpoint.canonicalUrl` keeps the normalized path; origin-only is just `originView` for the renderer/`net.provider`.
+5. ACCEPTED: credential liveness rule; rotation destroys the old key; older revisions become unselectable.
+6. Prerequisite: modelId = `dnarsh/td26-modelid@e57b58e` (+ Codex Cf top-up), NOT `d17c528`.
+7. Wire op string `"setup"` is CONFIRMED (matches frozen `frame:"setup"`).
+8. Persistence redaction (ruling #d55f6dbe, f0770fc4): ONE trusted native pre-append sanitizer = built-in pattern scrub + exact-match run in RUST via private `credential.redact` over ALL stored credentials. The engine never holds secrets for redaction (no per-session redaction scope). Fail closed with `PERSIST_REDACTION_UNAVAILABLE`. This supersedes any engine-held-secret variant. Exact authority/lifetime of the native matcher (established before the first user append, valid for late tool/transcript sinks after request revoke) is UNSETTLED detail owned by the native credential/persistence owners.
+
+---
+
 ## 1. SETTLED existing contracts (read, cited)
 
 | # | Fact | Source |
