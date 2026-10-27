@@ -104,6 +104,19 @@ async function fixtureServer(served = artifacts, commits = {}) {
   };
 }
 
+const locks = new Map();
+const withLock = async (root, fn) => {
+  const prev = locks.get(root) ?? Promise.resolve();
+  let release;
+  locks.set(root, new Promise((r) => (release = r)));
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+};
+
 async function fileStore(root, faults = {}) {
   const at = (p) => join(root, p);
   return {
@@ -135,6 +148,29 @@ async function fileStore(root, faults = {}) {
       }
       await rm(at(path), { recursive: true, force: true });
     },
+    async removeIfUnreferenced(paths) {
+      if (faults.beforeUnref) await faults.beforeUnref();
+      return withLock(root, async () => {
+        let referenced = new Set();
+        try {
+          referenced = new Set(
+            JSON.parse(await readFile(at("installed.json"), "utf8")).map(
+              (r) => r.installDir,
+            ),
+          );
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+        const left = [];
+        for (const path of paths) {
+          if (referenced.has(path)) continue;
+          await rm(at(path), { recursive: true, force: true }).catch(() =>
+            left.push(path),
+          );
+        }
+        return left;
+      });
+    },
     async read(path) {
       try {
         return new Uint8Array(await readFile(at(path)));
@@ -152,19 +188,33 @@ async function fileStore(root, faults = {}) {
       }
     },
     async saveRecords(json, expectedPrevious) {
-      if (faults.records) throw new Error("records write failed");
       if (faults.slowSave) await faults.slowSave();
-      let current = null;
-      try {
-        current = await readFile(at("installed.json"), "utf8");
-      } catch (error) {
-        if (error.code !== "ENOENT") throw error;
-      }
-      if (current !== expectedPrevious) {
-        throw Object.assign(new Error("records changed"), { conflict: true });
-      }
-      await writeFile(at("installed.json.tmp"), json);
-      await rename(at("installed.json.tmp"), at("installed.json"));
+      if (faults.records) throw new Error("records write failed");
+      await withLock(root, async () => {
+        let current = null;
+        try {
+          current = await readFile(at("installed.json"), "utf8");
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+        if (current !== expectedPrevious) {
+          throw Object.assign(new Error("records changed"), { conflict: true });
+        }
+        for (const record of JSON.parse(json)) {
+          if (
+            !(await readFile(at(record.installDir)).then(
+              () => true,
+              () => false,
+            ))
+          ) {
+            throw Object.assign(new Error("record points at missing bytes"), {
+              conflict: true,
+            });
+          }
+        }
+        await writeFile(at("installed.json.tmp"), json);
+        await rename(at("installed.json.tmp"), at("installed.json"));
+      });
     },
   };
 }
@@ -796,5 +846,68 @@ test("a failing acquisition that found the bytes already promoted by another wri
       ["ls-ts", true],
       ["lsp", true],
     ]);
+  });
+});
+
+test("conflict cleanup is atomic with record commits: a reference committed while the loser waits keeps the bytes", async () => {
+  await withEnv(async ({ root, source }) => {
+    const gate = { release: null };
+    const slow = new Promise((r) => (gate.release = r));
+    const loser = await fileStore(root, {
+      slowSave: () => slow,
+      beforeUnref: null,
+    });
+    const winner = await fileStore(root);
+    const cat = verified(catalog());
+    const first = acquire({
+      plan: planFor(["lsp"]),
+      catalog: cat,
+      source,
+      store: loser,
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    await acquire({
+      plan: planFor(["lsp"]),
+      catalog: cat,
+      source,
+      store: winner,
+    });
+    gate.release();
+    await assert.rejects(first, (e) => e.code === "ERR_ACQ_CONFLICT");
+    assert.ok((await verifyInstalled(winner)).every((r) => r.ok));
+  });
+});
+
+test("a record can never point at bytes a concurrent cleanup removed: the commit is refused instead", async () => {
+  await withEnv(async ({ root, source }) => {
+    const l = { release: null };
+    const w = { release: null };
+    const loserGate = new Promise((r) => (l.release = r));
+    const winnerGate = new Promise((r) => (w.release = r));
+    const loser = await fileStore(root, {
+      slowSave: () => loserGate,
+      records: true,
+    });
+    const winner = await fileStore(root, { slowSave: () => winnerGate });
+    const cat = verified(catalog());
+    const first = acquire({
+      plan: planFor(["lsp"]),
+      catalog: cat,
+      source,
+      store: loser,
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    const second = acquire({
+      plan: planFor(["lsp"]),
+      catalog: cat,
+      source,
+      store: winner,
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    l.release();
+    await assert.rejects(first, (e) => e.code === "ERR_ACQ_STORE");
+    w.release();
+    await assert.rejects(second, (e) => e.code === "ERR_ACQ_CONFLICT");
+    assert.equal(await winner.loadRecords(), null);
   });
 });

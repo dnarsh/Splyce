@@ -54,8 +54,10 @@ export interface ArtifactSource {
 
 /**
  * File access the acquisition needs. `saveRecords` must replace the record file atomically AND only when the stored
- * text still equals `expectedPrevious` (compare-and-swap); otherwise it rejects with `{ conflict: true }` so a
- * concurrent acquisition can never be silently overwritten.
+ * text still equals `expectedPrevious` (compare-and-swap) AND every record's `installDir` still exists; otherwise it
+ * rejects with `{ conflict: true }`, so a concurrent acquisition can neither be silently overwritten nor leave a
+ * record pointing at bytes another cleanup removed. `removeIfUnreferenced` must be atomic with `saveRecords`
+ * (one lock or transaction): it removes only the given paths that no current record references.
  */
 export interface AcquisitionStore {
   stage(path: string, bytes: Uint8Array): Promise<void>;
@@ -66,6 +68,8 @@ export interface AcquisitionStore {
    */
   promote(from: string, to: string): Promise<void | "exists">;
   remove(path: string): Promise<void>;
+  /** Removes the paths no current record references; resolves with the paths it could not remove. */
+  removeIfUnreferenced(paths: readonly string[]): Promise<readonly string[]>;
   read(path: string): Promise<Uint8Array | null>;
   loadRecords(): Promise<string | null>;
   saveRecords(json: string, expectedPrevious: string | null): Promise<void>;
@@ -317,20 +321,12 @@ async function acquireNow(input: AcquireInput): Promise<AcquireResult> {
   const promoted: string[] = [];
   const cleanup = async (): Promise<string[]> => {
     const leftover: string[] = [];
-    // Bytes are content-addressed and may have been recorded by a concurrent acquisition that promoted
-    // "exists" over ours: never remove a directory the current records reference.
-    const referenced = new Set<string>();
+    // Bytes are content-addressed and may have been recorded by a concurrent acquisition that promoted "exists" over
+    // ours: only the store can check references and remove atomically, so never read-then-remove here.
     try {
-      for (const r of parseRecords(await store.loadRecords())) {
-        referenced.add(r.installDir);
-      }
+      leftover.push(...(await store.removeIfUnreferenced(promoted)));
     } catch {
-      // unreadable records: err on the side of keeping bytes
-      for (const dir of promoted) referenced.add(dir);
-    }
-    for (const dir of promoted) {
-      if (referenced.has(dir)) continue;
-      await store.remove(dir).catch(() => leftover.push(dir));
+      leftover.push(...promoted);
     }
     await store.remove(stagingRoot).catch(() => leftover.push(stagingRoot));
     return leftover;
