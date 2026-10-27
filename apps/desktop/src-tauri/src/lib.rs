@@ -16,9 +16,11 @@ pub fn run() {
         })
         .setup(|app| {
             let directory = app.path().resource_dir()?.join("engine");
+            let app_data_dir = app.path().app_data_dir()?;
             app.manage(ipc::BridgeState::start(
                 &directory,
                 env!("SPLYCE_ENGINE_MANIFEST_SHA256"),
+                &app_data_dir,
             )?);
             Ok(())
         })

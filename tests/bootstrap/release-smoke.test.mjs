@@ -1,35 +1,262 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { fileURLToPath } from "node:url";
 import {
   assertDriverProvenance,
-  assertUnavailable,
+  assertGenerationUnconfigured,
   ownedBy,
   sameProcess,
+  sanitizeSmokeDiagnostics,
+  webviewDebuggingFlags,
+  webviewOverrideFlags,
+  processElevation,
 } from "./release-smoke.mjs";
 
-test("smoke assertion rejects fabricated readiness and missing unavailable UI", () => {
+test("WebView override observations distinguish requested from effective flags", () => {
+  const folder = "C:\\private-profile\\fresh folder";
+  for (const argument of [
+    `--user-data-dir="${folder}"`,
+    `"--user-data-dir=${folder}"`,
+  ]) {
+    assert.deepEqual(
+      webviewOverrideFlags(`${argument} --disable-gpu`, folder.toUpperCase()),
+      {
+        disableGpu: true,
+        requestedFolderMatch: true,
+      },
+    );
+  }
+  for (const command of [
+    "",
+    "--disable-gpu-sandbox",
+    "--unrelated-disable-gpu",
+    '--user-data-dir="C:\\different"',
+    '--log-file="--disable-gpu"',
+    '--log-file="prefix --disable-gpu suffix"',
+    '--log-file="prefix \\" --disable-gpu suffix"',
+    '--log-file="prefix --user-data-dir=C:\\private-profile\\fresh folder"',
+  ]) {
+    assert.deepEqual(webviewOverrideFlags(command, folder), {
+      disableGpu: false,
+      requestedFolderMatch: false,
+    });
+  }
+  assert.equal(
+    webviewOverrideFlags("--disable-gpu", undefined).requestedFolderMatch,
+    null,
+  );
+});
+
+test(
+  "elevation inspection binds an owned child to its creation time",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const child = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      { windowsHide: true, stdio: "ignore" },
+    );
+    try {
+      await once(child, "spawn");
+      const candidate = JSON.parse(
+        execFileSync(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `Get-CimInstance Win32_Process -Filter 'ProcessId=${child.pid}' | Select-Object ProcessId,CreationDate | ConvertTo-Json -Compress`,
+          ],
+          { encoding: "utf8", windowsHide: true, timeout: 15000 },
+        ),
+      );
+      const observed = processElevation(candidate);
+      assert.equal(observed.status, "observed");
+      assert.equal(typeof observed.elevated, "boolean");
+      const inheritedElevation = execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+        ],
+        { encoding: "utf8", windowsHide: true, timeout: 15000 },
+      ).trim();
+      assert.match(inheritedElevation, /^(True|False)$/);
+      assert.equal(observed.elevated, inheritedElevation === "True");
+      assert.deepEqual(Object.keys(observed).sort(), ["elevated", "status"]);
+      const details = JSON.parse(
+        execFileSync(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            fileURLToPath(new URL("./process-elevation.ps1", import.meta.url)),
+            "-ProcessId",
+            String(candidate.ProcessId),
+            "-CreationTimeMs",
+            candidate.CreationDate.match(/\d+/)[0],
+            "-Details",
+          ],
+          { encoding: "utf8", windowsHide: true, timeout: 15000 },
+        ),
+      );
+      assert.equal(details.status, "observed");
+      assert.equal(details.elevated, observed.elevated);
+      assert([1, 2, 3].includes(details.elevationType));
+      assert(
+        details.linkedTokenAvailable === null ||
+          typeof details.linkedTokenAvailable === "boolean",
+      );
+      if (details.elevationType === 1)
+        assert.equal(details.linkedTokenAvailable, false);
+      assert.deepEqual(Object.keys(details).sort(), [
+        "elevated",
+        "elevationType",
+        "linkedTokenAvailable",
+        "status",
+      ]);
+      assert.deepEqual(
+        processElevation({ ...candidate, CreationDate: "/Date(0)/" }),
+        { status: "unknown", elevated: null },
+      );
+      assert.deepEqual(processElevation({ ...candidate, ProcessId: -1 }), {
+        status: "unknown",
+        elevated: null,
+      });
+      assert.deepEqual(
+        processElevation({ ...candidate, CreationDate: "invalid" }),
+        { status: "unknown", elevated: null },
+      );
+    } finally {
+      const exited = once(child, "exit");
+      child.kill();
+      await exited;
+    }
+  },
+);
+
+test("WebView debugging diagnostics expose only valid ports and pipe flags", () => {
+  assert.deepEqual(
+    webviewDebuggingFlags(
+      '"C:\\Users\\private-user\\browser.exe" --remote-debugging-port=9222 --remote-debugging-pipe private-credential',
+    ),
+    { port: 9222, pipe: true },
+  );
+  assert.deepEqual(webviewDebuggingFlags('--remote-debugging-port "0"'), {
+    port: 0,
+    pipe: false,
+  });
+  for (const command of [
+    "--remote-debugging-port=65536",
+    "--remote-debugging-port=-1",
+    "--remote-debugging-port=12invalid",
+    "--unrelated-remote-debugging-port=9222",
+    "",
+  ]) {
+    assert.deepEqual(webviewDebuggingFlags(command), {
+      port: null,
+      pipe: false,
+    });
+  }
+});
+
+test("public smoke diagnostics retain the failed request and omit private data", () => {
+  const diagnostic = sanitizeSmokeDiagnostics(
+    {
+      case: "bootstrap-unavailable-release",
+      passed: false,
+      applicationElevation: [
+        { status: "observed", elevated: true },
+        { status: "unknown", elevated: null },
+      ],
+      sessionRequestElapsedMs: 20001,
+      webviewDebugging: {
+        declaredPorts: [9222],
+        pipe: false,
+        endpoints: [
+          { host: "127.0.0.1", port: 9222, status: 200, devtools: true },
+        ],
+      },
+      failureProcesses: {
+        nativeDriverStarted: true,
+        applicationStarted: false,
+        applicationWindowStarted: false,
+      },
+      pins: { webview2: "155.0.4283.62" },
+      failedRequest: {
+        method: "POST",
+        path: "/session/private-session/execute/sync",
+      },
+      error:
+        "Timeout at C:\\Users\\private-user\\Splyce\\smoke.mjs:1\nAuthorization: Bearer private-credential",
+      app: "C:\\Users\\private-user\\app.exe",
+      failureState: { text: "private-workspace-text" },
+      ownedProcesses: [{ ExecutablePath: "private-process" }],
+    },
+    "driver C:\\Users\\private-user\\driver.exe\ntoken=private-credential\nPOST /session/private-session/execute/sync",
+  );
+  const result = JSON.parse(diagnostic.result);
+  assert.equal(result.passed, false);
+  assert.deepEqual(result.applicationElevation, [
+    { status: "observed", elevated: true },
+    { status: "unknown", elevated: null },
+  ]);
+  assert.equal(result.sessionRequestElapsedMs, 20001);
+  assert.equal(result.webviewDebugging.endpoints[0].devtools, true);
+  assert.deepEqual(result.failureProcesses, {
+    nativeDriverStarted: true,
+    applicationStarted: false,
+    applicationWindowStarted: false,
+  });
+  assert.equal(result.pins.webview2, "155.0.4283.62");
+  assert.deepEqual(result.failedRequest, {
+    method: "POST",
+    path: "/session/<session>/execute/sync",
+  });
+  for (const value of [diagnostic.result, diagnostic.driverLog]) {
+    assert.doesNotMatch(
+      value,
+      /private-user|private-credential|private-workspace-text|private-process|private-session/,
+    );
+  }
+  assert.equal(result.app, undefined);
+  assert.equal(result.failureState, undefined);
+  assert.equal(result.ownedProcesses, undefined);
+});
+
+test("smoke requires native core readiness with generation unavailable and Send disabled", () => {
   const state = {
     connection: "unavailable",
-    readiness: { policy: "false", store: "false", receipts: "false" },
+    readiness: { policy: "true", store: "true", receipts: "true" },
     banner: true,
+    bannerHeading: "Generation unconfigured",
     ready: false,
+    sendDisabled: true,
   };
-  assertUnavailable(state);
+  assertGenerationUnconfigured(state);
   for (const name of ["policy", "store", "receipts"]) {
     assert.throws(() =>
-      assertUnavailable({
+      assertGenerationUnconfigured({
         ...state,
-        readiness: { ...state.readiness, [name]: "true" },
+        readiness: { ...state.readiness, [name]: "false" },
       }),
     );
   }
   for (const broken of [
     { connection: "ready" },
     { banner: false },
+    { bannerHeading: "Engine Unavailable" },
+    { sendDisabled: false },
+    { sendDisabled: undefined },
     { ready: true },
     { readiness: undefined },
   ]) {
-    assert.throws(() => assertUnavailable({ ...state, ...broken }));
+    assert.throws(() => assertGenerationUnconfigured({ ...state, ...broken }));
   }
 });
 

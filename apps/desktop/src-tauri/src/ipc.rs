@@ -85,6 +85,25 @@ impl Subscriptions {
     }
 
     fn forward(&mut self, event: Value) -> Result<(), BridgeError> {
+        if event["frame"] == "control" {
+            if event.as_object().is_none_or(|fields| {
+                fields.len() != 4
+                    || !["frame", "kind", "sessionId", "fromSeq"]
+                        .iter()
+                        .all(|key| fields.contains_key(*key))
+            }) || event["kind"] != "stream.resync"
+                || !opaque(&event["sessionId"])
+                || !matches_rule(&event["fromSeq"], &json!("uint"))
+            {
+                return Err(BridgeError::engine());
+            }
+            let session_id = event["sessionId"].as_str().unwrap();
+            let subscription = self.0.get(session_id).ok_or_else(BridgeError::engine)?;
+            if subscription.events.send(event.clone()).is_err() {
+                self.0.remove(session_id);
+            }
+            return Ok(());
+        }
         let session_id = event["sessionId"]
             .as_str()
             .ok_or_else(BridgeError::engine)?
@@ -100,8 +119,8 @@ impl Subscriptions {
             event["kind"].as_str(),
             Some("turn.stream_delta" | "turn.thought_delta")
         );
-        if event["protocolVersion"] != 1
-            || event["schemaVersion"] != 1
+        if event["protocolVersion"] != spec["protocolVersion"]
+            || event["schemaVersion"] != spec["schemaVersion"]
             || event["scopeId"] != subscription.scope_id
             || !opaque(&event["eventId"])
             || !opaque(&event["recordId"])
@@ -133,6 +152,11 @@ impl Subscriptions {
                     .contains(&field.as_str())
                 })
             })
+            || (event["kind"] == "engine.status"
+                && event
+                    .get("payload")
+                    .and_then(|payload| payload.get("ports"))
+                    .is_some_and(|ports| !valid_ports(ports)))
             || event.get("payloadArtifactId").is_some_and(|id| !opaque(id))
             || event.get("payload").is_some_and(|payload| {
                 !payload.is_object()
@@ -167,8 +191,12 @@ pub struct BridgeState {
 }
 
 impl BridgeState {
-    pub fn start(directory: &Path, digest: &str) -> Result<Self, crate::process::EngineError> {
-        let child = EngineChild::spawn(directory, digest)?;
+    pub fn start(
+        directory: &Path,
+        digest: &str,
+        app_data_dir: &Path,
+    ) -> Result<Self, crate::process::EngineError> {
+        let child = EngineChild::spawn(directory, digest, app_data_dir)?;
         let events = child.events();
         let state = Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -327,7 +355,8 @@ impl BridgeState {
             .subscriptions
             .lock()
             .map_err(|_| BridgeError::engine())?;
-        let lifecycle = json!({"protocolVersion":1,"kind":"engine_exited","expected":expected,"exitCode":null,"cleanupComplete":cleanup.is_ok()});
+        let spec: Value = serde_json::from_str(PROTOCOL).map_err(|_| BridgeError::engine())?;
+        let lifecycle = json!({"protocolVersion":spec["protocolVersion"],"kind":"engine_exited","expected":expected,"exitCode":null,"cleanupComplete":cleanup.is_ok()});
         subscriptions.close(&lifecycle);
         if let Some(channel) = inner.lifecycle.take() {
             let _ = channel.send(lifecycle);
@@ -406,7 +435,7 @@ fn valid_command(op: &str, value: &Value) -> bool {
     ];
     if command.len() != fields.len()
         || !fields.iter().all(|field| command.contains_key(*field))
-        || value["protocolVersion"] != 1
+        || value["protocolVersion"] != spec["protocolVersion"]
         || value["op"] != op
     {
         return false;
@@ -443,6 +472,46 @@ fn valid_command(op: &str, value: &Value) -> bool {
     })
 }
 
+fn valid_ports(value: &Value) -> bool {
+    let Some(ports) = value.as_object() else {
+        return false;
+    };
+    let keys = ["generation", "provider", "workspace", "modules"];
+    ports.len() == keys.len()
+        && keys
+            .iter()
+            .all(|key| ports.get(*key).is_some_and(Value::is_boolean))
+}
+
+fn valid_handshake(value: &Value, spec: &Value) -> bool {
+    let Some(readiness) = value["readiness"].as_object() else {
+        return false;
+    };
+    let Some(ports) = readiness.get("ports").and_then(Value::as_object) else {
+        return false;
+    };
+    let ready = readiness.get("state") == Some(&json!("ready"));
+    value.as_object().is_some_and(|fields| fields.len() == 8)
+        && value["schemaVersion"] == spec["schemaVersion"]
+        && value["protocolVersion"] == spec["protocolVersion"]
+        && value["engineProtocolVersion"] == spec["protocolVersion"]
+        && value["bridgeProtocolVersion"] == spec["protocolVersion"]
+        && value["piRevision"] == spec["piRevision"]
+        && value["entryMode"] == spec["foundation"]["entryMode"]
+        && value["disabledBuiltinExtensions"] == spec["foundation"]["disabledBuiltinExtensions"]
+        && readiness.len() == 5
+        && (ready || readiness.get("state") == Some(&json!("unavailable")))
+        && ["policy", "store", "receipts"]
+            .iter()
+            .all(|key| readiness.get(*key).is_some_and(Value::is_boolean))
+        && (!ready
+            || ["policy", "store", "receipts"]
+                .iter()
+                .all(|key| readiness.get(*key) == Some(&json!(true))))
+        && valid_ports(&readiness["ports"])
+        && (ready || ports.values().all(|value| value == &json!(false)))
+}
+
 #[tauri::command]
 pub async fn handshake(
     window: WebviewWindow,
@@ -451,7 +520,8 @@ pub async fn handshake(
     on_lifecycle: Channel<Value>,
 ) -> Result<Value, BridgeError> {
     caller(&window)?;
-    if protocol_version != 1 {
+    let spec: Value = serde_json::from_str(PROTOCOL).map_err(|_| BridgeError::engine())?;
+    if json!(protocol_version) != spec["protocolVersion"] {
         return Err(BridgeError::denied());
     }
     state
@@ -459,19 +529,8 @@ pub async fn handshake(
         .try_lock()
         .map_err(|_| BridgeError::denied())?
         .lifecycle = Some(on_lifecycle);
-    let value = state.call("handshake", json!({"protocolVersion":1}))?;
-    let spec: Value = serde_json::from_str(PROTOCOL).map_err(|_| BridgeError::engine())?;
-    if value.as_object().is_none_or(|fields| fields.len() != 8)
-        || value["schemaVersion"] != spec["schemaVersion"]
-        || value["protocolVersion"] != spec["protocolVersion"]
-        || value["engineProtocolVersion"] != 1
-        || value["bridgeProtocolVersion"] != 1
-        || value["piRevision"] != spec["piRevision"]
-        || value["entryMode"] != spec["foundation"]["entryMode"]
-        || value["disabledBuiltinExtensions"] != spec["foundation"]["disabledBuiltinExtensions"]
-        || value["readiness"]
-            != json!({"state":"unavailable","policy":false,"store":false,"receipts":false})
-    {
+    let value = state.call("handshake", json!({"protocolVersion": protocol_version}))?;
+    if !valid_handshake(&value, &spec) {
         return Err(BridgeError::engine());
     }
     Ok(value)
@@ -551,7 +610,42 @@ mod tests {
     }
 
     fn event() -> Value {
-        json!({"schemaVersion":1,"protocolVersion":1,"recordId":"record1","eventId":"event1","createdAt":"2026-10-26T00:00:00.000Z","sourceIds":[],"sessionId":"s1","scopeId":"w1","seq":1,"durable":false,"kind":"turn.stream_delta","payload":{"runId":"r1","delta":"hello"}})
+        json!({"schemaVersion":1,"protocolVersion":2,"recordId":"record1","eventId":"event1","createdAt":"2026-10-26T00:00:00.000Z","sourceIds":[],"sessionId":"s1","scopeId":"w1","seq":1,"durable":false,"kind":"turn.stream_delta","payload":{"runId":"r1","delta":"hello"}})
+    }
+
+    #[test]
+    fn handshake_requires_exact_ports_and_consistent_readiness() {
+        let spec: Value = serde_json::from_str(PROTOCOL).unwrap();
+        let mut value = json!({"protocolVersion": spec["protocolVersion"], "schemaVersion": spec["schemaVersion"],
+            "engineProtocolVersion": spec["protocolVersion"], "bridgeProtocolVersion": spec["protocolVersion"],
+            "piRevision": spec["piRevision"], "entryMode": spec["foundation"]["entryMode"],
+            "disabledBuiltinExtensions": spec["foundation"]["disabledBuiltinExtensions"],
+            "readiness": {"state":"ready", "policy":true, "store":true, "receipts":true,
+                "ports":{"generation":true,"provider":false,"workspace":false,"modules":false}}});
+        assert!(valid_handshake(&value, &spec));
+        value["readiness"]["ports"]["generation"] = json!("true");
+        assert!(!valid_handshake(&value, &spec));
+        value["readiness"]["ports"]["generation"] = json!(true);
+        value["readiness"]["state"] = json!("unavailable");
+        assert!(!valid_handshake(&value, &spec));
+        value["readiness"]["state"] = json!("ready");
+        value["readiness"]["ports"]["extra"] = json!(false);
+        assert!(!valid_handshake(&value, &spec));
+        value["readiness"]["ports"]
+            .as_object_mut()
+            .unwrap()
+            .remove("extra");
+        value["readiness"]["ports"]
+            .as_object_mut()
+            .unwrap()
+            .remove("modules");
+        assert!(!valid_handshake(&value, &spec));
+        value["readiness"]["ports"]["modules"] = json!(false);
+        value["readiness"]["policy"] = json!(false);
+        assert!(!valid_handshake(&value, &spec));
+        value["readiness"]["policy"] = json!(true);
+        value["protocolVersion"] = json!(1);
+        assert!(!valid_handshake(&value, &spec));
     }
 
     #[test]
@@ -602,6 +696,95 @@ mod tests {
     }
 
     #[test]
+    fn native_channel_forwards_only_valid_resync_controls_to_current_subscription() {
+        let mut subscriptions = Subscriptions::default();
+        let ack = json!({"sessionId":"s1","scopeId":"w1","afterSeq":0});
+        let (old_events, old_received) = recording_channel();
+        assert!(
+            subscriptions
+                .install("s1", 0, &ack, old_events, recording_channel().0)
+                .is_ok()
+        );
+        let (events, received) = recording_channel();
+        assert!(
+            subscriptions
+                .install("s1", 0, &ack, events, recording_channel().0)
+                .is_ok()
+        );
+        let control =
+            json!({"frame":"control","kind":"stream.resync","sessionId":"s1","fromSeq":0});
+        let mut nonzero = control.clone();
+        nonzero["fromSeq"] = json!(9_007_199_254_740_991_u64);
+        assert!(subscriptions.forward(control.clone()).is_ok());
+        assert!(subscriptions.forward(nonzero.clone()).is_ok());
+        assert!(subscriptions.forward(event()).is_ok());
+        assert!(old_received.lock().unwrap().is_empty());
+        assert_eq!(
+            received.lock().unwrap().as_slice(),
+            &[control.clone(), nonzero, event()]
+        );
+        let mut invalid = Vec::new();
+        for (key, value) in [
+            ("kind", json!("other")),
+            ("sessionId", json!("s2")),
+            ("sessionId", json!("../s1")),
+            ("fromSeq", json!(-1)),
+            ("fromSeq", json!(1.5)),
+            ("fromSeq", json!(9_007_199_254_740_992_u64)),
+            ("scopeId", json!("w1")),
+            ("seq", json!(1)),
+            ("durable", json!(true)),
+            ("recordId", json!("r1")),
+        ] {
+            let mut candidate = control.clone();
+            candidate[key] = value;
+            invalid.push(candidate);
+        }
+        let mut missing = control;
+        missing.as_object_mut().unwrap().remove("fromSeq");
+        invalid.push(missing);
+        for candidate in invalid {
+            assert!(subscriptions.forward(candidate).is_err());
+        }
+        assert_eq!(received.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn native_channel_validates_status_ports_before_delivery() {
+        let mut subscriptions = Subscriptions::default();
+        let (events, received) = recording_channel();
+        assert!(
+            subscriptions
+                .install(
+                    "s1",
+                    0,
+                    &json!({"sessionId":"s1","scopeId":"w1","afterSeq":0}),
+                    events,
+                    recording_channel().0,
+                )
+                .is_ok()
+        );
+        let mut status = event();
+        status["kind"] = json!("engine.status");
+        status["durable"] = json!(true);
+        status["payload"] = json!({"state":"ready","activeWorkers":0});
+        assert!(subscriptions.forward(status.clone()).is_ok());
+        let valid = json!({"generation":true,"provider":false,"workspace":false,"modules":false});
+        for ports in [
+            json!({}),
+            json!({"generation":1,"provider":false,"workspace":false,"modules":false}),
+            json!({"generation":false,"provider":false,"workspace":false,"modules":false,"extra":false}),
+        ] {
+            status["payload"]["ports"] = ports;
+            assert!(subscriptions.forward(status.clone()).is_err());
+            assert_eq!(received.lock().unwrap().len(), 1);
+        }
+        status["payload"]["ports"] = valid;
+        assert!(subscriptions.forward(status.clone()).is_ok());
+        assert_eq!(received.lock().unwrap().as_slice()[1], status);
+    }
+
+    #[test]
     fn replacing_and_closing_native_channels_releases_old_recipients() {
         let mut subscriptions = Subscriptions::default();
         let ack = json!({"sessionId":"s1","scopeId":"w1","afterSeq":0});
@@ -621,7 +804,7 @@ mod tests {
         assert!(subscriptions.forward(event()).is_ok());
         assert!(old_received.lock().unwrap().is_empty());
         assert_eq!(received.lock().unwrap().len(), 1);
-        let exited = json!({"protocolVersion":1,"kind":"engine_exited","expected":false,"exitCode":null,"cleanupComplete":true});
+        let exited = json!({"protocolVersion":2,"kind":"engine_exited","expected":false,"exitCode":null,"cleanupComplete":true});
         subscriptions.close(&exited);
         subscriptions.close(&exited);
         assert!(subscriptions.0.is_empty());
@@ -632,7 +815,7 @@ mod tests {
 
     #[test]
     fn shared_operations_reject_payload_authority_changes() {
-        let command = json!({"protocolVersion":1,"correlationId":"request1","sessionId":"s1","scopeId":"w-demo","expectedConfigRevision":"cfg1","expectedProfileRevision":"profile1","expectedPolicyRevision":"policy1","op":"engine.restart","payload":{}});
+        let command = json!({"protocolVersion":2,"correlationId":"request1","sessionId":"s1","scopeId":"w-demo","expectedConfigRevision":"cfg1","expectedProfileRevision":"profile1","expectedPolicyRevision":"policy1","op":"engine.restart","payload":{}});
         assert!(valid_command("engine.restart", &command));
         assert!(!valid_command("unknown", &command));
         let mut invalid = command.clone();
@@ -642,7 +825,7 @@ mod tests {
         invalid["scopeId"] = json!("../outside");
         assert!(!valid_command("engine.restart", &invalid));
         invalid = command.clone();
-        invalid["protocolVersion"] = json!(2);
+        invalid["protocolVersion"] = json!(1);
         assert!(!valid_command("engine.restart", &invalid));
     }
 }

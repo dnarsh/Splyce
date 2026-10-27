@@ -4,7 +4,11 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { assertUnavailable, ownedBy, sameProcess } from "../release-smoke.mjs";
+import {
+  assertGenerationUnconfigured,
+  ownedBy,
+  sameProcess,
+} from "../release-smoke.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const app = resolve(
@@ -58,6 +62,12 @@ export function state() {
         receipts: shell?.dataset.readinessReceipts,
       },
       banner: !!document.querySelector('[data-testid="unavailable-banner"]'),
+      bannerHeading: document.querySelector(
+        '[data-testid="unavailable-banner"] h2',
+      )?.textContent,
+      sendDisabled: document.querySelector(
+        'form[aria-label="Composer"] button[type="submit"]',
+      )?.disabled,
       ready: !!document.querySelector(".workspace-view"),
       text: document.body.innerText,
       origin: location.origin,
@@ -83,11 +93,17 @@ export async function connected() {
   const unavailable = await until(async () => {
     const value = await state();
     return value.connection === "unavailable" &&
-      value.readiness.policy === "false"
+      value.readiness.policy === "true"
       ? value
       : null;
   }, "real renderer's validated bootstrap handshake");
-  assertUnavailable(unavailable);
+  assertGenerationUnconfigured(unavailable);
+  await browser.execute(() => {
+    const input = document.querySelector("#composer-input");
+    input.value = "Bootstrap unavailable-generation check";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  assertGenerationUnconfigured(await state());
   assert(
     [
       "http://tauri.localhost",

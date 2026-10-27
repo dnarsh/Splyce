@@ -37,14 +37,20 @@ const subscribes = () =>
 
 let app: object | undefined;
 const readyHandshake = {
-  protocolVersion: 1,
+  protocolVersion: 2,
   schemaVersion: 1,
-  engineProtocolVersion: 1,
-  bridgeProtocolVersion: 1,
+  engineProtocolVersion: 2,
+  bridgeProtocolVersion: 2,
   piRevision: PI_REVISION,
   entryMode: FOUNDATION.entryMode,
   disabledBuiltinExtensions: [...FOUNDATION.disabledBuiltinExtensions],
-  readiness: { state: "ready", policy: true, store: true, receipts: true },
+  readiness: {
+    state: "ready",
+    policy: true,
+    store: true,
+    receipts: true,
+    ports: { generation: true, provider: true, workspace: true, modules: true },
+  },
 };
 beforeEach(() => {
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
@@ -83,6 +89,33 @@ const treeEvent = (sessionId: string, scopeId: string) =>
   }) as never;
 
 describe("App wiring", () => {
+  it("shows generation unconfigured while the native core is ready and runnable ports are unavailable", async () => {
+    ipc.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd !== "handshake") return undefined;
+      return {
+        ...readyHandshake,
+        readiness: {
+          ...readyHandshake.readiness,
+          ports: {
+            generation: false,
+            provider: false,
+            workspace: false,
+            modules: false,
+          },
+        },
+      };
+    });
+    await boot();
+    const shell = q("[data-testid=app-shell]")!;
+    expect(shell.dataset.connectionState).toBe("unavailable");
+    for (const service of ["Policy", "Store", "Receipts"])
+      expect(shell.dataset[`readiness${service}`]).toBe("true");
+    const banner = q("[data-testid=unavailable-banner]")!;
+    expect(banner.textContent).toContain("Generation unconfigured");
+    expect(banner.textContent).not.toMatch(/initializing/);
+    expect(button("Send").disabled).toBe(true);
+  });
+
   it("refreshes native readiness after Retry and observes the recovered engine exiting", async () => {
     await boot();
     ipc.ready = true;
@@ -96,7 +129,7 @@ describe("App wiring", () => {
       .filter(([command]) => command === "handshake")
       .at(-1)!;
     nativeHandshake[1].onLifecycle.onmessage({
-      protocolVersion: 1,
+      protocolVersion: 2,
       kind: "engine_exited",
       expected: false,
       exitCode: 1,
@@ -122,7 +155,7 @@ describe("App wiring", () => {
     await settle();
     dispatchEngineEvent({
       schemaVersion: 1,
-      protocolVersion: 1,
+      protocolVersion: 2,
       recordId: "rec_1",
       eventId: "evt_1",
       createdAt: "2026-10-26T00:00:00.000Z",
@@ -140,7 +173,7 @@ describe("App wiring", () => {
       ([command]) => command === "handshake",
     )!;
     nativeHandshake[1].onLifecycle.onmessage({
-      protocolVersion: 1,
+      protocolVersion: 2,
       kind: "engine_exited",
       expected: false,
       exitCode: 1,

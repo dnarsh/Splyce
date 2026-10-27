@@ -1,6 +1,7 @@
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import { createNativeHost } from "./native-host.mjs";
 import {
   CONTRACT_VERSION,
   PROTOCOL_VERSION,
@@ -73,32 +74,17 @@ export async function* readFrames(input) {
   if (headerBytes || payload) throw new FrameError();
 }
 
-async function unavailableHandshake() {
-  const { createAgentSession } =
-    await import("@earendil-works/pi-coding-agent");
-  let result;
-  try {
-    result = await createAgentSession();
-  } catch (error) {
-    if (error?.code !== "SPLYCE_UNAVAILABLE") throw error;
-    return validateHandshake({
-      protocolVersion: PROTOCOL_VERSION,
-      schemaVersion: CONTRACT_VERSION,
-      engineProtocolVersion: PROTOCOL_VERSION,
-      bridgeProtocolVersion: PROTOCOL_VERSION,
-      piRevision: PI_REVISION,
-      entryMode: FOUNDATION.entryMode,
-      disabledBuiltinExtensions: [...FOUNDATION.disabledBuiltinExtensions],
-      readiness: {
-        state: "unavailable",
-        policy: false,
-        store: false,
-        receipts: false,
-      },
-    });
-  }
-  await result.session.dispose();
-  throw new Error("Native unavailable readiness was not enforced");
+function nativeHandshake(host) {
+  return validateHandshake({
+    protocolVersion: PROTOCOL_VERSION,
+    schemaVersion: CONTRACT_VERSION,
+    engineProtocolVersion: PROTOCOL_VERSION,
+    bridgeProtocolVersion: PROTOCOL_VERSION,
+    piRevision: PI_REVISION,
+    entryMode: FOUNDATION.entryMode,
+    disabledBuiltinExtensions: [...FOUNDATION.disabledBuiltinExtensions],
+    readiness: host.handshakeReadiness,
+  });
 }
 
 export function isRequest(value) {
@@ -122,38 +108,76 @@ export function isRequest(value) {
 }
 
 export async function runHost(input = process.stdin, output = process.stdout) {
-  const handshake = await unavailableHandshake();
-  for await (const request of readFrames(input)) {
-    if (!isRequest(request)) throw new FrameError();
-    let reply;
-    let shutdown = false;
-    if (
-      request.method === "handshake" &&
-      Object.keys(request.params).length === 1 &&
-      request.params.protocolVersion === PROTOCOL_VERSION
-    ) {
-      reply = { id: request.id, ok: true, value: handshake };
-    } else if (
-      request.method === "shutdown" &&
-      Object.keys(request.params).length === 0
-    ) {
-      reply = { id: request.id, ok: true, value: { state: "stopped" } };
-      shutdown = true;
-    } else {
-      reply = {
-        id: request.id,
-        ok: false,
-        error: {
-          code: "POLICY_DENIED",
-          message:
-            "Engine unavailable until native policy, store and receipts are connected",
-          correlationId: request.id,
-          retryable: false,
-        },
-      };
+  let host;
+  try {
+    for await (const request of readFrames(input)) {
+      if (!isRequest(request)) throw new FrameError();
+      let reply;
+      let shutdown = false;
+      if (host === undefined) {
+        // The native parent sends this before exposing any renderer command.
+        if (
+          request.id !== "native-bootstrap" ||
+          request.method !== "native.bootstrap" ||
+          Object.keys(request.params).length !== 1 ||
+          !Object.hasOwn(request.params, "appDataDir")
+        )
+          throw new FrameError();
+        host = createNativeHost(request.params.appDataDir);
+        reply = { id: request.id, ok: true, value: { state: "initialized" } };
+      } else if (request.method === "native.bootstrap") {
+        throw new FrameError();
+      } else if (
+        request.method === "handshake" &&
+        Object.keys(request.params).length === 1 &&
+        request.params.protocolVersion === PROTOCOL_VERSION
+      ) {
+        reply = { id: request.id, ok: true, value: nativeHandshake(host) };
+      } else if (
+        request.method === "shutdown" &&
+        Object.keys(request.params).length === 0
+      ) {
+        reply = { id: request.id, ok: true, value: { state: "stopped" } };
+        shutdown = true;
+      } else {
+        let code = "POLICY_DENIED";
+        if (request.method === "send") {
+          try {
+            host.assertCurrent(request.params.scopeId, {
+              configRevision: request.params.expectedConfigRevision,
+              profileRevision: request.params.expectedProfileRevision,
+              policyRevision: request.params.expectedPolicyRevision,
+            });
+          } catch (error) {
+            if (error?.code === "STALE_REVISION") code = error.code;
+            else if (
+              ![
+                "NATIVE_INVALID_ID",
+                "NATIVE_CONFIG_UNAVAILABLE",
+                "NATIVE_PROFILE_UNAVAILABLE",
+                "NATIVE_PROFILE_STALE",
+              ].includes(error?.code)
+            )
+              throw error;
+          }
+        }
+        reply = {
+          id: request.id,
+          ok: false,
+          error: {
+            code,
+            message:
+              "Generation unconfigured; native runnable ports are unavailable",
+            correlationId: request.id,
+            retryable: false,
+          },
+        };
+      }
+      if (!output.write(encodeFrame(reply))) await once(output, "drain");
+      if (shutdown) return;
     }
-    if (!output.write(encodeFrame(reply))) await once(output, "drain");
-    if (shutdown) return;
+  } finally {
+    host?.close();
   }
 }
 

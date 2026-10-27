@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { assertUnavailable, sameProcess } from "../release-smoke.mjs";
+import {
+  assertGenerationUnconfigured,
+  sameProcess,
+} from "../release-smoke.mjs";
 import {
   assertGone,
   closeApplication,
@@ -17,18 +20,8 @@ describe("packaged bootstrap unavailable and child crash", () => {
     const denied = await browser.executeAsync((done) => {
       window.__TAURI_INTERNALS__
         .invoke("send", {
-          op: "engine.restart",
-          payload: {
-            protocolVersion: 1,
-            correlationId: "embedded-denied",
-            sessionId: "bootstrap-session",
-            scopeId: "bootstrap-workspace",
-            expectedConfigRevision: "bootstrap",
-            expectedProfileRevision: "bootstrap",
-            expectedPolicyRevision: "bootstrap",
-            op: "engine.restart",
-            payload: {},
-          },
+          op: "session.start",
+          payload: { protocolVersion: 0 },
         })
         .then(
           () => done({ allowed: true }),
@@ -36,7 +29,7 @@ describe("packaged bootstrap unavailable and child crash", () => {
         );
     });
     assert.deepEqual(denied, { allowed: false, code: "POLICY_DENIED" });
-    assertUnavailable(await state());
+    assertGenerationUnconfigured(await state());
     verifyOwned(application, engine);
     assert.equal(
       processes().filter(
@@ -45,7 +38,7 @@ describe("packaged bootstrap unavailable and child crash", () => {
           candidate.ExecutablePath === engine.ExecutablePath,
       ).length,
       1,
-      "Denied restart leaves the original child intact",
+      "Denied command leaves the original child intact",
     );
     await record("denied", { denied, engine });
     verifyOwned(application, engine);
@@ -56,6 +49,7 @@ describe("packaged bootstrap unavailable and child crash", () => {
     }, "actual engine exit reaches the renderer lifecycle channel");
     assert.equal(stopped.ready, false);
     assert.equal(stopped.banner, true);
+    assert.equal(stopped.sendDisabled, true);
     assert.match(stopped.text, /Engine stopped/i);
     assert(!processes().some((candidate) => sameProcess(candidate, engine)));
     await record("disconnected", stopped);

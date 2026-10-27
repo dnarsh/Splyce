@@ -242,10 +242,12 @@
     <div class="app-content" class:conversation={currentRun !== undefined}>
       {#if status !== "ready"}
         <div class="unavailable-view" data-testid="unavailable-banner" role="status" aria-live="polite">
-          <h2>{stopped ? "Engine stopped" : "Engine Unavailable"}</h2>
+          <h2>{stopped ? "Engine stopped" : readiness?.state === "ready" ? "Generation unconfigured" : "Engine Unavailable"}</h2>
           <p>
             {stopped
               ? "The native engine exited. Restart the app to reconnect; the last transcript may be incomplete."
+              : readiness?.state === "ready"
+                ? "Generation requires a configured provider and workspace."
               : "Backend native services (policy, durable store, and receipts) are currently initializing or unavailable. Release qualification requires all three subsystems verified before task execution."}
           </p>
         </div>

@@ -1,5 +1,5 @@
 export const CONTRACT_VERSION = 1 as const;
-export const PROTOCOL_VERSION = 1 as const;
+export const PROTOCOL_VERSION = 2 as const;
 // Proposed bounded defaults; performance qualification remains outstanding.
 export const TRANSPORT_LIMITS = Object.freeze({
   maxInlineBytes: 65536,
@@ -235,6 +235,12 @@ export interface RecordBodies {
     installedModuleRefs: string[];
     egressPolicyRefs: string[];
     limitsArtifactId: string;
+    /** Exact connection revisions; absent on historical snapshots. */
+    bindings?: {
+      role: string;
+      providerConnectionId: string;
+      connectionRevision: string;
+    }[];
   };
   selectionTransition: {
     transitionId: string;
@@ -269,6 +275,9 @@ export interface RecordBodies {
     changedValuesArtifactId: string;
     state: (typeof CONFIGURATION_STATES)[number];
     outcomeRef: string | null;
+    /** Present together only for an explicit provider-profile selection. */
+    profileId?: string;
+    profileRevision?: string;
   };
   sessionWriterLease: {
     piSessionId: string;
@@ -324,6 +333,7 @@ type Rule =
   | "bool"
   | "limits"
   | "toolSummary"
+  | "portAvailability"
   | "eventEnvelope"
   | readonly string[];
 type Shape = { readonly [key: string]: Rule };
@@ -613,6 +623,7 @@ export interface EventPayloads {
   "engine.status": {
     state: "ready" | "busy" | "stopping" | "stopped";
     activeWorkers: number;
+    ports?: PortAvailability;
   };
   "stream.resync": { fromSeq: number };
   "run.reconnect_snapshot": {
@@ -696,6 +707,7 @@ const EVENT_SCHEMAS = {
   },
 } as const satisfies { [K in EventKind]: Shape };
 const EVENT_OPTIONAL: Partial<Record<EventKind, Shape>> = {
+  "engine.status": { ports: "portAvailability" },
   "turn.tool_outcome": {
     outcomeRef: "ref",
     error: "text",
@@ -720,6 +732,13 @@ export const BRIDGE_PROTOCOL_JSON = JSON.stringify({
   eventKinds: EVENT_KINDS,
 });
 
+export interface PortAvailability {
+  generation: boolean;
+  provider: boolean;
+  workspace: boolean;
+  modules: boolean;
+}
+
 export interface Handshake {
   protocolVersion: typeof PROTOCOL_VERSION;
   schemaVersion: typeof CONTRACT_VERSION;
@@ -733,6 +752,7 @@ export interface Handshake {
     policy: boolean;
     store: boolean;
     receipts: boolean;
+    ports: PortAvailability;
   };
 }
 
@@ -876,6 +896,12 @@ function json(
   ancestors.delete(value);
 }
 
+/** Preserve strict JSON admissibility before cloning, without reference callbacks. */
+export function snapshotPersistedJson(value: unknown): unknown {
+  json(value, true);
+  return structuredClone(value);
+}
+
 function contextValid(context: ContractContext): void {
   requireThat(
     context !== null &&
@@ -928,6 +954,9 @@ function rule(
     return;
   }
   switch (spec) {
+    case "portAvailability":
+      validatePortAvailability(value);
+      break;
     case "eventEnvelope": {
       const event = validateEvent(value, context);
       requireThat(event.durable, "INVALID_SHAPE", "durable event");
@@ -1036,7 +1065,11 @@ function shape(
       );
 }
 function version(value: unknown, field: string): void {
-  requireThat(value === CONTRACT_VERSION, "UNSUPPORTED_VERSION", field);
+  requireThat(
+    value === (field === "schemaVersion" ? CONTRACT_VERSION : PROTOCOL_VERSION),
+    "UNSUPPORTED_VERSION",
+    field,
+  );
 }
 function current(
   value: Record<string, unknown>,
@@ -1075,6 +1108,37 @@ export function validateRecord<K extends RecordKind>(
   const record = object(value, "record");
   metadata(record, context);
   shape(record, RECORD_SCHEMAS[kind], {}, context, false);
+  if (kind === "profileSnapshot" && Object.hasOwn(record, "bindings")) {
+    requireThat(Array.isArray(record.bindings), "INVALID_SHAPE", "bindings");
+    const roles = new Set<string>();
+    for (const value of record.bindings as unknown[]) {
+      const binding = object(value, "binding");
+      shape(
+        binding,
+        { role: "id", providerConnectionId: "id", connectionRevision: "id" },
+        {},
+        context,
+        true,
+      );
+      const role = binding.role as string;
+      requireThat(!roles.has(role), "INVALID_SHAPE", "duplicate binding role");
+      roles.add(role);
+    }
+    requireThat(roles.has("chat"), "INVALID_SHAPE", "chat binding");
+  }
+  if (kind === "configurationTransition") {
+    const hasProfile = Object.hasOwn(record, "profileId");
+    const hasRevision = Object.hasOwn(record, "profileRevision");
+    requireThat(
+      hasProfile === hasRevision,
+      "INVALID_SHAPE",
+      "profile identity",
+    );
+    if (hasProfile) {
+      opaque(record.profileId, "profileId");
+      opaque(record.profileRevision, "profileRevision");
+    }
+  }
   if (kind === "event") {
     const envelope = object(record.envelope, "envelope");
     requireThat(
@@ -1294,6 +1358,26 @@ export function validateEvent(
   return value as SplyceEvent;
 }
 
+export function validatePortAvailability(value: unknown): PortAvailability {
+  json(value, false);
+  const ports = object(value, "readiness.ports");
+  const keys = ["generation", "provider", "workspace", "modules"];
+  requireThat(
+    Object.keys(ports).length === keys.length &&
+      keys.every(
+        (key) => Object.hasOwn(ports, key) && typeof ports[key] === "boolean",
+      ),
+    "INVALID_SHAPE",
+    "readiness.ports",
+  );
+  return Object.freeze({
+    generation: ports.generation as boolean,
+    provider: ports.provider as boolean,
+    workspace: ports.workspace as boolean,
+    modules: ports.modules as boolean,
+  });
+}
+
 export function validateHandshake(value: unknown): Handshake {
   json(value, false);
   const handshake = object(value, "handshake");
@@ -1339,9 +1423,9 @@ export function validateHandshake(value: unknown): Handshake {
   );
   const readiness = object(handshake.readiness, "readiness");
   requireThat(
-    Object.keys(readiness).length === 4 &&
+    Object.keys(readiness).length === 5 &&
       Object.keys(readiness).every((key) =>
-        ["state", "policy", "store", "receipts"].includes(key),
+        ["state", "policy", "store", "receipts", "ports"].includes(key),
       ),
     "INVALID_SHAPE",
     "readiness",
@@ -1353,6 +1437,12 @@ export function validateHandshake(value: unknown): Handshake {
   );
   for (const key of ["policy", "store", "receipts"])
     requireThat(typeof readiness[key] === "boolean", "INVALID_SHAPE", key);
+  const ports = validatePortAvailability(readiness.ports);
+  requireThat(
+    readiness.state === "ready" || !Object.values(ports).some(Boolean),
+    "INVALID_SHAPE",
+    "readiness.ports",
+  );
   requireThat(
     readiness.state !== "ready" ||
       (readiness.policy === true &&

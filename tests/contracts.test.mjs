@@ -46,7 +46,7 @@ test("transport defaults are exact, immutable and shared with the native build s
 });
 test("TD-01: native build spec comes from the shared operation definitions", () => {
   const spec = JSON.parse(BRIDGE_PROTOCOL_JSON);
-  assert.equal(spec.protocolVersion, 1);
+  assert.equal(spec.protocolVersion, 2);
   assert.equal(spec.schemaVersion, 1);
   assert.equal(spec.piRevision, "d5b3de22d0e24a3e9c38a9410d3329b099717283");
   assert.deepEqual(
@@ -87,7 +87,7 @@ const rejects = (call) =>
       error.code.length > 0,
   );
 const command = (op, payload) => ({
-  protocolVersion: 1,
+  protocolVersion: 2,
   correlationId: "request1",
   sessionId: "s1",
   scopeId: "w-demo",
@@ -99,7 +99,7 @@ const command = (op, payload) => ({
 });
 const event = (fields = {}) => ({
   schemaVersion: 1,
-  protocolVersion: 1,
+  protocolVersion: 2,
   recordId: "rec-event",
   eventId: "event1",
   createdAt: "2026-10-26T00:00:00.000Z",
@@ -115,7 +115,7 @@ const event = (fields = {}) => ({
 
 test("TD-01: public package exports the frozen versions and pinned Pi revision", () => {
   assert.equal(CONTRACT_VERSION, 1);
-  assert.equal(PROTOCOL_VERSION, 1);
+  assert.equal(PROTOCOL_VERSION, 2);
   assert.equal(PI_REVISION, "d5b3de22d0e24a3e9c38a9410d3329b099717283");
   assert.deepEqual(FOUNDATION, {
     entryMode: "sdk-host",
@@ -312,7 +312,7 @@ test("TD-01: commands reject unknown operation, stale identity and revision", ()
   const restart = command("engine.restart", {});
   assert.deepEqual(validateCommand(restart, context), restart);
   for (const patch of [
-    { protocolVersion: 2 },
+    { protocolVersion: 1 },
     { op: "execute.arbitrary" },
     { scopeId: "other" },
     { sessionId: "other" },
@@ -478,7 +478,7 @@ test("TD-01: event-specific scope/session and replay cursors reject mismatches",
 test("TD-01: events reject invalid identities, payload variants and unknown messages", () => {
   for (const patch of [
     { schemaVersion: 2 },
-    { protocolVersion: 2 },
+    { protocolVersion: 1 },
     { kind: "unknown.required" },
     { scopeId: "other" },
     { sessionId: "other" },
@@ -565,12 +565,56 @@ test("shared inline default accepts 65536 UTF-8 payload bytes and rejects one ex
   assert.deepEqual(validateEvent(input, bounded), input);
 });
 
+test("engine status ports use the same exact availability contract", () => {
+  const ports = {
+    generation: false,
+    provider: false,
+    workspace: false,
+    modules: false,
+  };
+  const status = event({
+    kind: "engine.status",
+    payload: { state: "ready", activeWorkers: 0, ports },
+  });
+  assert.deepEqual(validateEvent(status, context), status);
+  for (const invalid of [
+    {},
+    { ...ports, generation: 1 },
+    { ...ports, extra: false },
+  ])
+    rejects(() =>
+      validateEvent(
+        { ...status, payload: { ...status.payload, ports: invalid } },
+        context,
+      ),
+    );
+  rejects(() => validateEvent({ ...status, protocolVersion: 1 }, context));
+  assert.deepEqual(
+    validateEvent(
+      { ...status, payload: { state: "ready", activeWorkers: 0 } },
+      context,
+    ).payload,
+    { state: "ready", activeWorkers: 0 },
+  );
+});
+
 test("TD-01: frozen handshake accepts unavailable but requires all readiness guards", () => {
   const input = fixture("handshake");
   assert.deepEqual(validateHandshake(input), input);
   const ready = {
     ...input,
-    readiness: { state: "ready", policy: true, store: true, receipts: true },
+    readiness: {
+      state: "ready",
+      policy: true,
+      store: true,
+      receipts: true,
+      ports: {
+        generation: true,
+        provider: true,
+        workspace: true,
+        modules: true,
+      },
+    },
   };
   assert.deepEqual(validateHandshake(ready), ready);
   for (const field of [
@@ -579,7 +623,12 @@ test("TD-01: frozen handshake accepts unavailable but requires all readiness gua
     "engineProtocolVersion",
     "bridgeProtocolVersion",
   ])
-    rejects(() => validateHandshake({ ...input, [field]: 2 }));
+    rejects(() =>
+      validateHandshake({
+        ...input,
+        [field]: field === "schemaVersion" ? 2 : 1,
+      }),
+    );
   for (const field of ["policy", "store", "receipts"])
     rejects(() =>
       validateHandshake({
@@ -587,6 +636,20 @@ test("TD-01: frozen handshake accepts unavailable but requires all readiness gua
         readiness: { ...ready.readiness, [field]: false },
       }),
     );
+  for (const ports of [
+    {},
+    { ...ready.readiness.ports, generation: "true" },
+    { ...ready.readiness.ports, extra: false },
+  ])
+    rejects(() =>
+      validateHandshake({ ...ready, readiness: { ...ready.readiness, ports } }),
+    );
+  rejects(() =>
+    validateHandshake({
+      ...input,
+      readiness: { ...input.readiness, ports: ready.readiness.ports },
+    }),
+  );
   for (const patch of [
     { piRevision: "unknown" },
     { entryMode: "rpc" },
