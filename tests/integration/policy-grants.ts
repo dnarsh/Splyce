@@ -210,6 +210,149 @@ const assertDenied = (
   assert.equal(error?.code, code);
 };
 
+for (const capability of [
+  "fs.read",
+  "net.provider",
+  "fs.write",
+  "shell.run",
+] as const) {
+  test(`public check revalidates a revoked ${capability} grant after an await`, async (t) => {
+    const f = fixture(t);
+    const once = capability === "fs.write" || capability === "shell.run";
+    const extra = capability === "net.provider" ? { origin: ORIGIN } : {};
+    const grantId = f.mint(capability, once ? "a1" : undefined, extra);
+    const policy = f.policy();
+    const permit = f.permit("a1", grantId, capability, extra);
+    policy.authorize(permit as never);
+    assert.doesNotThrow(() =>
+      policy.check(permit.toolCallId, permit.toolName, undefined),
+    );
+    await Promise.resolve();
+    const other = Store.open(f.path);
+    try {
+      other.revokeGrant(grantId, caller);
+    } finally {
+      other.close();
+    }
+    // The host projection and run still contain this ID: Store is authoritative.
+    assert.throws(
+      () => policy.check(permit.toolCallId, permit.toolName, undefined),
+      { name: "AdmissionError", code: "GRANT_REVOKED" },
+      "a revoked Store grant must be denied by the public check",
+    );
+    assert.deepEqual(f.states("a1"), ["denied"]);
+  });
+}
+
+test("public check observes changed workspace identity on the same permit", (t) => {
+  const f = fixture(t);
+  const grantId = f.mint("fs.read");
+  const policy = f.policy();
+  const permit = f.permit("a1", grantId, "fs.read");
+  policy.authorize(permit as never);
+  assert.doesNotThrow(() =>
+    policy.check(permit.toolCallId, permit.toolName, undefined),
+  );
+  f.identity.set(f.workspaceId, { ...IDENTITY, fileId: "2" });
+  assert.throws(
+    () => policy.check(permit.toolCallId, permit.toolName, undefined),
+    { name: "AdmissionError", code: "WORKSPACE_IDENTITY_CHANGED" },
+    "a changed identity must be denied by the public check",
+  );
+  assert.deepEqual(f.states("a1"), ["denied"]);
+});
+
+test("public check accepts its running once action but rejects completed replay", async (t) => {
+  const f = fixture(t);
+  const grantId = f.mint("fs.write", "a1");
+  const policy = f.policy();
+  const permit = f.permit("a1", grantId, "fs.write");
+  policy.authorize(permit as never);
+  policy.reserve(permit.toolCallId, permit.toolName, undefined);
+  await policy.prepare(
+    permit.toolCallId,
+    permit.toolName,
+    ARGS,
+    undefined,
+    undefined,
+  );
+  policy.finish(permit.toolCallId, permit.toolName, ARGS, undefined);
+  let effects = 0;
+  await policy.execute(
+    permit.toolCallId,
+    permit.toolName,
+    ARGS,
+    async () => {
+      policy.check(permit.toolCallId, permit.toolName, undefined);
+      effects += 1;
+      return { isError: false };
+    },
+    undefined,
+  );
+  assert.equal(
+    effects,
+    1,
+    "the same running action retains its consumed grant",
+  );
+  assert.throws(
+    () => policy.check(permit.toolCallId, permit.toolName, undefined),
+    { name: "AdmissionError", code: "GRANT_CONSUMED" },
+    "public check must reject a completed once action as replay",
+  );
+});
+
+test("revocation during canonicalization denies before intent receipts", async (t) => {
+  const f = fixture(t);
+  const grantId = f.mint("fs.read");
+  const policy = f.policy();
+  const permit = f.permit("a1", grantId, "fs.read");
+  policy.authorize(permit as never);
+  policy.reserve(permit.toolCallId, permit.toolName, undefined);
+  await policy.prepare(
+    permit.toolCallId,
+    permit.toolName,
+    ARGS,
+    undefined,
+    undefined,
+  );
+  policy.finish(permit.toolCallId, permit.toolName, ARGS, undefined);
+  let revoked = false;
+  let effects = 0;
+  const args = new Proxy(ARGS, {
+    getOwnPropertyDescriptor(target, key) {
+      if (!revoked) {
+        f.store.revokeGrant(grantId, caller);
+        revoked = true;
+      }
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  const error = await attempt(
+    policy.execute(
+      permit.toolCallId,
+      permit.toolName,
+      args,
+      async () => {
+        effects += 1;
+        return { isError: false };
+      },
+      undefined,
+    ),
+  );
+  assert.equal(revoked, true, "canonicalization revoked the real Store grant");
+  assert.equal(
+    effects,
+    0,
+    "revocation during canonicalization prevents effect",
+  );
+  assertDenied(error, "GRANT_REVOKED");
+  assert.deepEqual(
+    f.states("a1"),
+    ["proposed", "denied"],
+    "the pre-intent recheck prevents approval under revoked authority",
+  );
+});
+
 test("an fs.write with a once grant runs once and consumes the grant with its running receipt", async (t) => {
   const f = fixture(t);
   const grantId = f.mint("fs.write", "a1");
@@ -246,7 +389,8 @@ test("an fs.write without a grant is denied and never reaches the effect", async
   );
   assert.equal(effects.n, 0, "write without grant must not run");
   assertDenied(error, "GRANT_REQUIRED");
-  assert.deepEqual(f.states("a1"), ["proposed", "denied"]);
+  // Rejected before reserve: record denial without inventing a proposal.
+  assert.deepEqual(f.states("a1"), ["denied"]);
 });
 
 test("a consumed once grant cannot be reused by another action", async (t) => {
@@ -273,7 +417,8 @@ test("a consumed once grant cannot be reused by another action", async (t) => {
   );
   assert.equal(effects.n, 1, "a reused once grant must not run again");
   assertDenied(error, "GRANT_CONSUMED");
-  assert.deepEqual(f.states("a2"), ["proposed", "denied"]);
+  // Rejected before reserve: record denial without inventing a proposal.
+  assert.deepEqual(f.states("a2"), ["denied"]);
 });
 
 test("a revocation between consumption and callback denies the effect and records it", async (t) => {
@@ -318,7 +463,8 @@ test("a changed directory identity between calls is WORKSPACE_IDENTITY_CHANGED",
   );
   assert.equal(effects.n, 2, "changed identity must not run");
   assertDenied(error, "WORKSPACE_IDENTITY_CHANGED");
-  assert.deepEqual(f.states("r3"), ["proposed", "denied"]);
+  // Rejected before reserve: record denial without inventing a proposal.
+  assert.deepEqual(f.states("r3"), ["denied"]);
 });
 
 test("a permit without an explicit capability is denied before any grant use", async (t) => {
@@ -459,33 +605,32 @@ registerHooks({ load(url, context, next) {
   const grants = fileURLToPath(new URL("./grants.ts", import.meta.url));
   for (const [name, cuts, file, pattern, observation] of [
     [
-      "grant checks around the callback",
+      "pre-intent revalidation after argument canonicalization",
+      [{ file: policy, from: "this.requireGrant(permit, once);", to: "" }],
+      self,
+      "revocation during canonicalization",
+      "the pre-intent recheck prevents approval under revoked authority",
+    ],
+    [
+      "Store grant revalidation on every public check",
       [
         {
           file: policy,
-          from: "this.requireGrant(permit, once);",
+          from: "this.requireGrant(permit, ONCE_CAPABILITIES.has(permit.capability));",
           to: "",
-          nth: 0,
-        },
-        {
-          file: policy,
-          from: "this.requireGrant(permit, once);",
-          to: "",
-          nth: 0,
         },
       ],
       self,
-      "changed directory identity",
-      "changed identity must not run",
+      "public check revalidates a revoked",
+      "a revoked Store grant must be denied by the public check",
     ],
     [
       "post-consumption revalidation",
       [
         {
           file: policy,
-          from: "this.requireGrant(permit, once);",
+          from: "// No asynchronous callback separates the final fences from executor handoff.\n        this.check(toolCallId, toolName, signal);",
           to: "",
-          nth: 1,
         },
       ],
       self,

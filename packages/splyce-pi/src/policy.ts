@@ -207,6 +207,7 @@ export class NativePolicy {
       owner.epoch !== permit.ownership.epoch
     )
       this.deny(permit, "STALE_OWNERSHIP");
+    this.requireGrant(permit, ONCE_CAPABILITIES.has(permit.capability));
   }
 
   reserve(
@@ -397,7 +398,6 @@ export class NativePolicy {
       throw error;
     }
     // No asynchronous callback separates the final fences from executor handoff.
-    this.requireGrant(permit, once);
     this.check(toolCallId, toolName, signal);
     let result: T;
     try {
