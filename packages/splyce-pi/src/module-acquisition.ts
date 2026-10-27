@@ -59,7 +59,12 @@ export interface ArtifactSource {
  */
 export interface AcquisitionStore {
   stage(path: string, bytes: Uint8Array): Promise<void>;
-  promote(from: string, to: string): Promise<void>;
+  /**
+   * Moves staged bytes to their content-addressed destination. When the destination already exists (another
+   * acquisition committed the same pin) the staged copy is discarded and "exists" is returned: those bytes are not
+   * ours and must never be removed by our cleanup.
+   */
+  promote(from: string, to: string): Promise<void | "exists">;
   remove(path: string): Promise<void>;
   read(path: string): Promise<Uint8Array | null>;
   loadRecords(): Promise<string | null>;
@@ -95,6 +100,14 @@ export interface AcquireInput {
   /** Required for `custom`: the user was shown that a custom source is not covered by the official catalog. */
   readonly customAcknowledged?: boolean;
   readonly signal?: AbortSignal;
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
 }
 
 const verifiedCatalogs = new WeakSet<object>();
@@ -304,7 +317,19 @@ async function acquireNow(input: AcquireInput): Promise<AcquireResult> {
   const promoted: string[] = [];
   const cleanup = async (): Promise<string[]> => {
     const leftover: string[] = [];
+    // Bytes are content-addressed and may have been recorded by a concurrent acquisition that promoted
+    // "exists" over ours: never remove a directory the current records reference.
+    const referenced = new Set<string>();
+    try {
+      for (const r of parseRecords(await store.loadRecords())) {
+        referenced.add(r.installDir);
+      }
+    } catch {
+      // unreadable records: err on the side of keeping bytes
+      for (const dir of promoted) referenced.add(dir);
+    }
     for (const dir of promoted) {
+      if (referenced.has(dir)) continue;
       await store.remove(dir).catch(() => leftover.push(dir));
     }
     await store.remove(stagingRoot).catch(() => leftover.push(stagingRoot));
@@ -321,8 +346,7 @@ async function acquireNow(input: AcquireInput): Promise<AcquireResult> {
     for (const { entry, path } of staged) {
       interrupted(signal);
       const dir = installDirOf(entry);
-      await store.promote(path, dir);
-      promoted.push(dir);
+      if ((await store.promote(path, dir)) !== "exists") promoted.push(dir);
     }
     interrupted(signal);
     const added = staged.map(({ entry }): InstalledRecord => ({
@@ -436,7 +460,8 @@ export function verifyCatalog(
       "the catalog has no entries list",
     );
   }
-  const entries = Object.freeze([...(parsed.entries as CatalogEntry[])]);
+  // Verified means unchangeable: a mutable entry after verification would let altered content keep official provenance.
+  const entries = deepFreeze([...(parsed.entries as CatalogEntry[])]);
   verifiedCatalogs.add(entries);
   return entries;
 }

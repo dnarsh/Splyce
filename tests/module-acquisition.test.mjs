@@ -115,6 +115,15 @@ async function fileStore(root, faults = {}) {
     async promote(from, to) {
       if (faults.promote === to) throw new Error("rename failed");
       await mkdir(dirname(at(to)), { recursive: true });
+      if (
+        await readFile(at(to)).then(
+          () => true,
+          () => false,
+        )
+      ) {
+        await rm(at(from), { recursive: true, force: true });
+        return "exists";
+      }
       await rename(at(from), at(to));
     },
     async remove(path) {
@@ -719,4 +728,73 @@ test("a typed failure with a cleanup that cannot finish also names the leftover 
     },
     { served: tampered },
   );
+});
+
+test("a conflict loser sharing a dependency with the winner never removes the winner's committed bytes", async () => {
+  await withEnv(async ({ root, source }) => {
+    const gate = { release: null };
+    const slow = new Promise((r) => (gate.release = r));
+    const loser = await fileStore(root, { slowSave: () => slow });
+    const winner = await fileStore(root);
+    const cat = verified(catalog());
+    const first = acquire({
+      plan: planFor(["lsp"]),
+      catalog: cat,
+      source,
+      store: loser,
+    });
+    // let the loser stage and promote ls-ts + lsp before the winner commits the same closure
+    await new Promise((r) => setTimeout(r, 150));
+    const second = await acquire({
+      plan: planFor(["lsp"]),
+      catalog: cat,
+      source,
+      store: winner,
+    });
+    assert.equal(second.added.length, 2);
+    gate.release();
+    await assert.rejects(first, (e) => e.code === "ERR_ACQ_CONFLICT");
+    const reports = await verifyInstalled(winner);
+    assert.deepEqual(reports.map((r) => [r.id, r.ok]).sort(), [
+      ["ls-ts", true],
+      ["lsp", true],
+    ]);
+  });
+});
+
+test("a verified catalog cannot be altered afterwards", () => {
+  const cat = verified(catalog());
+  assert.throws(() => {
+    cat[0].digest = "sha256:" + "0".repeat(64);
+  }, TypeError);
+  assert.throws(() => cat[0].requires.push("evil"), TypeError);
+  assert.throws(() => cat.push(cat[0]), TypeError);
+});
+
+test("a failing acquisition that found the bytes already promoted by another writer leaves them for that writer", async () => {
+  await withEnv(async ({ root, source }) => {
+    const gate = { release: null };
+    const slow = new Promise((r) => (gate.release = r));
+    const slowWriter = await fileStore(root, { slowSave: () => slow });
+    const failing = await fileStore(root, { records: true });
+    const cat = verified(catalog());
+    const first = acquire({
+      plan: planFor(["lsp"]),
+      catalog: cat,
+      source,
+      store: slowWriter,
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    await assert.rejects(
+      acquire({ plan: planFor(["lsp"]), catalog: cat, source, store: failing }),
+      (e) => e.code === "ERR_ACQ_STORE",
+    );
+    gate.release();
+    await first;
+    const reports = await verifyInstalled(slowWriter);
+    assert.deepEqual(reports.map((r) => [r.id, r.ok]).sort(), [
+      ["ls-ts", true],
+      ["lsp", true],
+    ]);
+  });
 });
