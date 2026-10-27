@@ -84,6 +84,9 @@ function fail(message: string): never {
   throw new Error(`invalid job: ${message}`);
 }
 
+const ANCHOR =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
 export function validateJob(def: JobDefinition): void {
   if (typeof def.jobId !== "string" || def.jobId === "")
     fail("jobId is required");
@@ -94,7 +97,15 @@ export function validateJob(def: JobDefinition): void {
   if (schedule.kind === "interval") {
     if (!Number.isSafeInteger(schedule.everyMs) || schedule.everyMs <= 0)
       fail("everyMs must be a positive integer");
-    if (Number.isNaN(Date.parse(schedule.anchor))) fail("anchor is not a date");
+    // An anchor without an offset is parsed in the host's zone: the same stored job would fire at different instants
+    // on different machines. Require an explicit UTC offset.
+    if (
+      !ANCHOR.test(schedule.anchor) ||
+      Number.isNaN(Date.parse(schedule.anchor))
+    )
+      fail(
+        "anchor must be an ISO date-time with an explicit UTC offset (Z or +hh:mm)",
+      );
     return;
   }
   if (schedule.kind === "daily") {
@@ -224,7 +235,9 @@ function scan(
       mm,
       schedule.timeZone,
     );
-    if (at > after && at <= upTo) all.push(occurrenceOf(jobId, at));
+    // A skipped local date (e.g. Pacific/Apia) maps two days to one instant: one physical occurrence, one entry.
+    if (at > after && at <= upTo && all[all.length - 1]?.scheduledFor !== at)
+      all.push(occurrenceOf(jobId, at));
   }
   const list = all.slice(Math.max(0, all.length - limit));
   return {

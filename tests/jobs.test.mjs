@@ -301,3 +301,60 @@ test("an outcome for a run that is not open is rejected", () => {
     recordOutcome(start(def), "job-a@2026-01-01T01:00:00.000Z", "succeeded"),
   );
 });
+
+test("an interval anchor without an explicit UTC offset is rejected (host-zone dependent)", () => {
+  for (const anchor of [
+    "2026-01-01T09:00:00",
+    "2026-01-01",
+    "2026-01-01T09:00",
+    "not a date",
+  ]) {
+    assert.throws(
+      () =>
+        planTick({
+          def: {
+            ...interval(),
+            schedule: { kind: "interval", everyMs: HOUR, anchor },
+          },
+          state: createJobState(interval(), 0),
+          now: HOUR,
+          enabled: true,
+          granted: true,
+        }),
+      /anchor/,
+      anchor,
+    );
+  }
+  for (const anchor of [
+    "2026-01-01T09:00:00Z",
+    "2026-01-01T14:30:00+05:30",
+    "2026-01-01T09:00Z",
+  ]) {
+    assert.doesNotThrow(() =>
+      occurrencesBetween(
+        {
+          ...interval(),
+          schedule: { kind: "interval", everyMs: HOUR, anchor },
+        },
+        0,
+        HOUR,
+      ),
+    );
+  }
+});
+
+test("a daily schedule across a skipped local date (Pacific/Apia) yields each physical instant once", () => {
+  const def = {
+    jobId: "apia",
+    schedule: { kind: "daily", at: "12:00", timeZone: "Pacific/Apia" },
+    catchUp: "skip",
+    overlap: "skip",
+  };
+  // Apia skipped 2011-12-30: the window covers the gap.
+  const from = Date.UTC(2011, 11, 28);
+  const to = Date.UTC(2012, 0, 2);
+  const list = occurrencesBetween(def, from, to);
+  const instants = list.map((o) => o.scheduledFor);
+  assert.equal(new Set(instants).size, instants.length);
+  assert.equal(new Set(list.map((o) => o.occurrenceId)).size, list.length);
+});
