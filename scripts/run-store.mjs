@@ -41,7 +41,10 @@ if (args.length === 0) {
   else if (args[1] === "C6_event_ledger")
     files = ["tests/integration/events.ts"];
   else if (args[1] === "C2_workspace_tools")
-    files = ["tests/integration/workspace-tools.ts"];
+    files = [
+      "tests/integration/workspace-tools.ts",
+      "tests/integration/shell-compaction.ts",
+    ];
   else if (args[1] === "C4_credential_resolution")
     files = ["tests/integration/credentials.ts"];
   else {

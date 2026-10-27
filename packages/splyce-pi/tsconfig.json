@@ -31,6 +31,7 @@
     "src/policy-node.d.ts",
     "src/node-child-process.d.ts",
     "src/workspace-tools-node.d.ts",
+    "src/shell-compaction.ts",
     "src/workspace-tools.ts"
   ]
 }

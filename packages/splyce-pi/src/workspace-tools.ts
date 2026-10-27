@@ -9,6 +9,7 @@
 
 import { spawn } from "node:child_process";
 import { Worker } from "node:worker_threads";
+import { COMPACT_BYTES, compact } from "./shell-compaction.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   lstat,
@@ -111,6 +112,8 @@ export interface ToolResult {
   summary: ToolSummary;
   /** Files a search skipped for size; kept outside summary, which is a strict wire shape. */
   skipped?: number;
+  /** Shell only: the uncompacted output, still bounded by maxOutputBytes. */
+  raw?: string;
 }
 export interface WorkspaceTool {
   name: string;
@@ -135,7 +138,12 @@ export interface WorkspaceToolsOptions {
   receipts: ReceiptPort;
   sessionId: string;
   workspaceId: string;
-  limits?: { timeoutMs: number; maxOutputBytes: number };
+  limits?: {
+    timeoutMs: number;
+    maxOutputBytes: number;
+    /** Byte budget of the compacted shell text shown to the model; default 8 KiB. */
+    compactBytes?: number;
+  };
 }
 
 const ENV_ALLOW = new Set(
@@ -153,6 +161,7 @@ const MAX_PATTERN = 256;
 const GREP_FILE_MS = 400;
 const MATCH_WORKER = `const { parentPort, workerData } = require("node:worker_threads");
 const re = new RegExp(workerData.source, workerData.flags);
+parentPort.postMessage("ready");
 parentPort.on("message", (m) => {
   const hits = [];
   const ls = m.text.split("\\n");
@@ -202,35 +211,49 @@ function matcher(re: RegExp, signal?: AbortSignal) {
     workerData: { source: re.source, flags: re.flags },
   });
   let pending: ((r: number[] | WorkspaceToolError) => void) | undefined;
-  w.on("message", (m) => pending?.(m as number[]));
-  w.on("error", () =>
-    pending?.(new WorkspaceToolError("IO_ERROR", "search worker failed")),
-  );
+  // The time budget starts when the worker is up, not while it boots.
+  let up: () => void;
+  const ready = new Promise<void>((r) => (up = r));
+  w.on("message", (m) => (m === "ready" ? up() : pending?.(m as number[])));
+  let broken = false;
+  w.on("error", () => {
+    broken = true;
+    up();
+    pending?.(new WorkspaceToolError("IO_ERROR", "search worker failed"));
+  });
   return {
     test: (text: string, room: number, ms: number) =>
       new Promise<number[]>((done, reject) => {
         const finish = (r: number[] | WorkspaceToolError) => {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           signal?.removeEventListener("abort", onAbort);
           pending = undefined;
           if (r instanceof WorkspaceToolError) reject(r);
           else done(r);
         };
-        const timer = setTimeout(
-          () =>
-            finish(
-              new WorkspaceToolError(
-                "GREP_BUDGET",
-                "search exceeded its time budget",
-              ),
-            ),
-          ms,
-        );
+        let timer: ReturnType<typeof setTimeout> | undefined;
         const onAbort = () =>
           finish(new WorkspaceToolError("ABORTED", "aborted"));
         signal?.addEventListener("abort", onAbort, { once: true });
-        pending = finish;
-        w.postMessage({ text, room, maxLine: MAX_GREP_LINE });
+        void ready.then(() => {
+          if (signal?.aborted) return;
+          if (broken)
+            return finish(
+              new WorkspaceToolError("IO_ERROR", "search worker failed"),
+            );
+          timer = setTimeout(
+            () =>
+              finish(
+                new WorkspaceToolError(
+                  "GREP_BUDGET",
+                  "search exceeded its time budget",
+                ),
+              ),
+            ms,
+          );
+          pending = finish;
+          w.postMessage({ text, room, maxLine: MAX_GREP_LINE });
+        });
       }),
     close: () => void w.terminate(),
   };
@@ -287,6 +310,7 @@ export function createWorkspaceTools(
   const { workspaces, grants, receipts, sessionId, workspaceId } = opts;
   const timeoutMs = opts.limits?.timeoutMs ?? 120_000;
   const maxBytes = opts.limits?.maxOutputBytes ?? 50 * 1024;
+  const compactBytes = opts.limits?.compactBytes ?? COMPACT_BYTES;
   const first =
     workspaces.workspace(workspaceId) ??
     fail("WORKSPACE_UNKNOWN", "workspace is not admitted");
@@ -638,13 +662,18 @@ export function createWorkspaceTools(
         const r = await exec(kind, command, ms, signal);
         return { summary: `exit ${String(r.code)}`, ok: r.code === 0, r };
       });
-      return done(
-        r.code === 0 ? r.text : `${r.text}\n[exit code ${String(r.code)}]`,
-        started,
-        r.bytes,
-        r.truncated,
-        r.code,
-      );
+      const tail = r.code === 0 ? "" : `\n[exit code ${String(r.code)}]`;
+      const c = compact(r.text, compactBytes);
+      return {
+        ...done(
+          c.text + tail,
+          started,
+          r.bytes,
+          r.truncated || c.lossy,
+          r.code,
+        ),
+        raw: r.text + tail,
+      };
     },
   });
 

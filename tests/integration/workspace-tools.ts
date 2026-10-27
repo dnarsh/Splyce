@@ -40,7 +40,11 @@ interface Grant {
   revoked?: boolean;
 }
 
-function harness(limits?: { timeoutMs?: number; maxOutputBytes?: number }) {
+function harness(limits?: {
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+  compactBytes?: number;
+}) {
   const dir = mkdtempSync(join(base, "case-"));
   const root = join(dir, "root");
   const outside = join(dir, "outside");
@@ -794,11 +798,12 @@ test("shell summary reports exit code, raw bytes, duration and preview", async (
 test("shell summary: capped output keeps the raw size and truncated true; preview is at most 2048 chars", async () => {
   const h = harness({ maxOutputBytes: 5000 });
   const big = nodeCmd(
-    "process.stdout.write('a'.repeat(9000)),setTimeout(process.stdout.write.bind(process.stdout,'b'.repeat(500)),300)",
+    "process.stdout.write(Array.from({length:900},(_,i)=>'line '+i).join('\\n')),setTimeout(process.stdout.write.bind(process.stdout,'\\n'+'b'.repeat(500)),300)",
   );
   approveSh(h, big);
   const r = await result(h, sh, { command: big });
-  assert.equal(r.summary.bytes, 9500);
+  const first = Array.from({ length: 900 }, (_, i) => `line ${String(i)}`);
+  assert.equal(r.summary.bytes, Buffer.byteLength(first.join("\n")) + 501);
   assert.equal(r.summary.truncated, true);
   assert.equal(r.summary.preview.length, 2048);
   assert.ok(r.text.length < 5100);
@@ -1036,4 +1041,83 @@ test("more windows device spellings are denied", winOnly, async () => {
     "CONOUT$",
     "sub/conin$.x",
   ]);
+});
+
+const readOut = nodeCmd(
+  "process.stdout.write(require('fs').readFileSync('out.txt','utf8'))",
+);
+
+test("shell returns compacted text to the model, the raw output beside it and the raw size in the summary", async () => {
+  const h = harness();
+  const noisy = [
+    ...Array.from(
+      { length: 400 },
+      (_, i) => `   \u001b[32mCompiling\u001b[0m crate-${String(i)} v0.1.0`,
+    ),
+    "error[E0425]: cannot find value `x` in this scope",
+    "progress 10%\rprogress 100%",
+    "",
+  ].join("\n");
+  writeFileSync(join(h.root, "out.txt"), noisy);
+  approveSh(h, readOut);
+  const r = (await (
+    h.tools[sh] as {
+      result(
+        a: object,
+      ): Promise<{ text: string; raw: string; summary: Summary }>;
+    }
+  ).result({ command: readOut })) as {
+    text: string;
+    raw: string;
+    summary: Summary;
+  };
+  assert.ok(r.raw.includes("crate-399") && r.raw.includes("\u001b[32m"));
+  assert.ok(!r.text.includes("\u001b"));
+  assert.match(r.text, /error\[E0425\]: cannot find value `x`/);
+  assert.match(r.text, /progress 100%/);
+  assert.ok(!r.text.includes("progress 10%"));
+  assert.ok(
+    r.text.length * 3 < r.raw.length,
+    `${String(r.text.length)}/${String(r.raw.length)}`,
+  );
+  assert.equal(r.summary.bytes, Buffer.byteLength(noisy));
+  assert.equal(r.summary.truncated, true);
+  assert.equal(r.summary.exitCode, 0);
+  assert.equal(r.summary.preview, r.text.slice(0, 2048));
+});
+
+test("the compaction budget is a per-call limit and short output passes through untouched", async () => {
+  const h = harness({ compactBytes: 600 });
+  const lines = Array.from({ length: 300 }, (_, i) => `row ${String(i)}`);
+  writeFileSync(join(h.root, "out.txt"), lines.join("\n"));
+  approveSh(h, readOut);
+  const cut = await result(h, sh, { command: readOut });
+  assert.ok(cut.text.length <= 600, String(cut.text.length));
+  assert.match(cut.text, /\[… \d+ lines elided\]/);
+  assert.equal(cut.summary.truncated, true);
+  const cmd = nodeCmd("process.stdout.write('a'+String.fromCharCode(10)+'b')");
+  approveSh(h, cmd);
+  const short = await result(h, sh, { command: cmd });
+  assert.equal(short.text, "a\nb");
+  assert.equal(short.summary.truncated, false);
+});
+
+test("compaction does not change what the child can see: secret env never reaches raw or compacted text", async () => {
+  const h = harness();
+  process.env.SPLYCE_TEST_API_KEY = "sekret-value";
+  const cmd = nodeCmd("process.stdout.write(JSON.stringify(process.env))");
+  approveSh(h, cmd);
+  try {
+    const r = (await (
+      h.tools[sh] as {
+        result(a: object): Promise<{ text: string; raw: string }>;
+      }
+    ).result({ command: cmd })) as { text: string; raw: string };
+    assert.ok(
+      !r.raw.includes("sekret-value") && !r.text.includes("sekret-value"),
+    );
+    assert.match(r.raw, /PATH|Path/);
+  } finally {
+    delete process.env.SPLYCE_TEST_API_KEY;
+  }
 });
