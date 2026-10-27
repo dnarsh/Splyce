@@ -54,6 +54,39 @@ fn invalid_manifest() -> EngineError {
     )
 }
 
+fn bootstrap_request(app_data_dir: &Path) -> Result<Value, EngineError> {
+    let path = app_data_dir
+        .to_str()
+        .filter(|path| !path.contains('\0'))
+        .ok_or_else(|| EngineError::new("ENGINE_START", "Invalid application data directory"))?;
+    #[cfg(windows)]
+    let path = {
+        let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+        let bytes = path.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || !matches!(bytes[2], b'\\' | b'/')
+        {
+            return Err(EngineError::new(
+                "ENGINE_START",
+                "Invalid application data directory",
+            ));
+        }
+        path
+    };
+    #[cfg(not(windows))]
+    if !app_data_dir.is_absolute() {
+        return Err(EngineError::new(
+            "ENGINE_START",
+            "Invalid application data directory",
+        ));
+    }
+    Ok(
+        serde_json::json!({"id":"native-bootstrap","method":"native.bootstrap","params":{"appDataDir":path}}),
+    )
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Manifest {
@@ -302,17 +335,17 @@ pub use windows::{EngineChild, EngineEvents};
 mod windows {
     use super::*;
     use std::collections::VecDeque;
-    use std::ffi::{OsStr, c_void};
+    use std::ffi::{c_void, OsStr};
     use std::mem::{size_of, zeroed};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{
-        HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::System::JobObjects::*;
@@ -538,7 +571,9 @@ mod windows {
         pub fn spawn(
             engine_dir: &Path,
             expected_manifest_digest: &str,
+            app_data_dir: &Path,
         ) -> Result<Self, EngineError> {
+            let bootstrap = bootstrap_request(app_data_dir)?;
             let (root, verified_files) = verify_bundle(engine_dir, expected_manifest_digest)?;
             let executable = launch_path(&root.join("node.exe"))?;
             let cwd = launch_path(&root)?;
@@ -758,6 +793,13 @@ mod windows {
                 child.stop()?;
                 return Err(EngineError::new("ENGINE_START", "Engine could not start"));
             }
+            let response = child.request(&bootstrap)?;
+            if response
+                != serde_json::json!({"id":"native-bootstrap","ok":true,"value":{"state":"initialized"}})
+            {
+                child.stop()?;
+                return Err(EngineError::new("ENGINE_START", "Engine bootstrap failed"));
+            }
             Ok(child)
         }
 
@@ -938,6 +980,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bootstrap_uses_only_absolute_unicode_application_data_path() {
+        let path = std::env::temp_dir().join("splyce-data");
+        let request = bootstrap_request(&path).unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({"id":"native-bootstrap","method":"native.bootstrap","params":{"appDataDir":path.to_str().unwrap().strip_prefix(r"\\?\").unwrap_or(path.to_str().unwrap())}})
+        );
+        assert!(bootstrap_request(Path::new("relative")).is_err());
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let invalid =
+                std::ffi::OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xd800]);
+            assert!(bootstrap_request(Path::new(&invalid)).is_err());
+            for invalid in [
+                r"\\server\share",
+                r"\\?\UNC\server\share",
+                r"\\.\device",
+                r"\\?\GLOBALROOT\device",
+                r"C:relative",
+                r"\rooted",
+                "C:\\bad\0path",
+            ] {
+                assert!(
+                    bootstrap_request(Path::new(invalid)).is_err(),
+                    "{invalid:?}"
+                );
+            }
+            for valid in [r"C:\Users\data", r"C:/Users/data", r"\\?\C:\Users\data"] {
+                assert!(bootstrap_request(Path::new(valid)).is_ok(), "{valid:?}");
+            }
+            assert_eq!(
+                bootstrap_request(Path::new(r"\\?\C:\Users\data")).unwrap()["params"]["appDataDir"],
+                r"C:\Users\data"
+            );
+        }
+    }
+
+    #[test]
     fn frames_round_trip_and_enforce_encoded_limit() {
         let value = serde_json::json!({"id":"one","ok":true,"value":null});
         assert_eq!(
@@ -962,12 +1043,10 @@ mod tests {
         assert!(digest_matches(bytes, &digest));
         assert!(!digest_matches(br#"{}"#, &digest));
         assert!(!digest_matches(bytes, ""));
-        assert!(
-            serde_json::from_slice::<Manifest>(
-                br#"{"schemaVersion":1,"piRevision":"pin","files":[],"extra":true}"#
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_slice::<Manifest>(
+            br#"{"schemaVersion":1,"piRevision":"pin","files":[],"extra":true}"#
+        )
+        .is_err());
     }
 
     #[test]

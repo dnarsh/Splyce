@@ -29,9 +29,11 @@ use windows_sys::Win32::System::Threading::{
 // These real Node endpoints qualify transport faults, never SDK or GUI readiness.
 const HOST: &str = r#"
 import { spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
+import { resolve, toNamespacedPath } from 'node:path';
 writeFileSync('../started.txt', String(process.pid));
 let pending = Buffer.alloc(0);
+let bootstrapped = false;
 function send(value) {
   const payload = Buffer.from(JSON.stringify(value));
   const header = Buffer.alloc(4);
@@ -45,6 +47,17 @@ process.stdin.on('data', chunk => {
     if (pending.length < length + 4) break;
     const request = JSON.parse(pending.subarray(4, length + 4));
     pending = pending.subarray(length + 4);
+    if (!bootstrapped) {
+      writeFileSync('../bootstrap.json', JSON.stringify(request));
+      const expectedPath = toNamespacedPath(resolve('../data'));
+      const nativePath = toNamespacedPath(request.params?.appDataDir);
+      if (Object.keys(request).length !== 3 || request.id !== 'native-bootstrap' || request.method !== 'native.bootstrap' || Object.keys(request.params).length !== 1 || nativePath !== expectedPath) process.exit(1);
+      bootstrapped = true;
+      if (existsSync('../reject-bootstrap')) {
+        setTimeout(() => send({id:request.id,ok:true,value:{state:'initialized',extra:true}}), 300);
+      } else send({id:request.id,ok:true,value:{state:'initialized'}});
+      continue;
+    }
     if (request.method === 'hang') continue;
     if (request.method === 'stale') request.id = 'stale';
     if (request.method === 'oversize') {
@@ -69,7 +82,7 @@ process.stdin.on('data', chunk => {
       send({ id: request.id, ok: true, value: { sessionId, scopeId: 'w1', afterSeq } });
       for (let seq = 1; seq <= 300; seq++) {
         send({ event: {
-          schemaVersion: 1, protocolVersion: 1, recordId: `record${seq}`,
+          schemaVersion: 1, protocolVersion: 2, recordId: `record${seq}`,
           eventId: `event${seq}`, createdAt: '2026-10-26T00:00:00.000Z',
           sourceIds: [], sessionId, scopeId: 'w1', seq,
           durable: false, kind: 'turn.stream_delta',
@@ -201,7 +214,12 @@ impl Fixture {
     }
 
     fn spawn(&self) -> EngineChild {
-        EngineChild::spawn(&self.engine(), &self.expected_digest).unwrap()
+        EngineChild::spawn(
+            &self.engine(),
+            &self.expected_digest,
+            &self.directory.join("data"),
+        )
+        .unwrap()
     }
 
     fn cleanup(&self) -> std::io::Result<()> {
@@ -245,6 +263,46 @@ fn assert_running(process: &OwnedHandle) {
         unsafe { WaitForSingleObject(process.as_raw_handle(), 0) },
         WAIT_TIMEOUT
     );
+}
+
+#[test]
+fn bootstrap_is_first_and_malformed_reply_reaps_child() {
+    let fixture = Fixture::new();
+    let child = fixture.spawn();
+    let request: Value =
+        serde_json::from_slice(&fs::read(fixture.directory.join("bootstrap.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        request,
+        json!({"id":"native-bootstrap","method":"native.bootstrap","params":{"appDataDir":fixture.directory.join("data").to_str().unwrap()}})
+    );
+    assert!(!fixture.directory.join("data").exists());
+    drop(child);
+    fs::remove_file(fixture.directory.join("started.txt")).unwrap();
+    fs::write(fixture.directory.join("reject-bootstrap"), b"").unwrap();
+    let engine = fixture.engine();
+    let digest = fixture.expected_digest.clone();
+    let data = fixture.directory.join("data");
+    let task = std::thread::spawn(move || {
+        EngineChild::spawn(&engine, &digest, &data)
+            .err()
+            .unwrap()
+            .code
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let started = fixture.directory.join("started.txt");
+    let pid = loop {
+        if let Ok(pid) = fs::read_to_string(&started)
+            && let Ok(pid) = pid.parse::<u32>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let process = observed_process(&json!(pid));
+    assert_eq!(task.join().unwrap(), "ENGINE_START");
+    assert_exited(&process);
 }
 
 fn assert_exited(process: &OwnedHandle) {
@@ -469,7 +527,12 @@ fn rejected_response_callback_fails_closed_and_wakes_reader() {
 #[test]
 fn native_channel_delivers_all_buffered_events_before_child_exit_lifecycle() {
     let fixture = Fixture::new();
-    let state = BridgeState::start(&fixture.engine(), &fixture.expected_digest).unwrap();
+    let state = BridgeState::start(
+        &fixture.engine(),
+        &fixture.expected_digest,
+        &fixture.directory.join("data"),
+    )
+    .unwrap();
     let timeline = Arc::new(Mutex::new(Vec::<Value>::new()));
     let event_sink = timeline.clone();
     let on_event = Channel::new(move |body| {
@@ -598,7 +661,8 @@ fn parent_termination_reaps_engine_and_descendant() {
         );
         let root = PathBuf::from(root);
         let expected = std::env::var("SPLYCE_PROCESS_CHILD_DIGEST").unwrap();
-        let mut child = EngineChild::spawn(&root.join("engine"), &expected).unwrap();
+        let mut child =
+            EngineChild::spawn(&root.join("engine"), &expected, &root.join("data")).unwrap();
         let reply = child
             .request(&json!({"id": "one", "method": "descendant", "params": {}}))
             .unwrap();
@@ -657,7 +721,14 @@ fn tampered_files_and_self_consistent_manifest_never_launch() {
     let fixture = Fixture::new();
     let changed_host = format!("{HOST}\n");
     fs::write(fixture.engine().join("host.mjs"), &changed_host).unwrap();
-    assert!(EngineChild::spawn(&fixture.engine(), &fixture.expected_digest).is_err());
+    assert!(
+        EngineChild::spawn(
+            &fixture.engine(),
+            &fixture.expected_digest,
+            &fixture.directory.join("data")
+        )
+        .is_err()
+    );
     assert!(!fixture.directory.join("started.txt").exists());
     let mut changed_manifest: Value = serde_json::from_slice(&fixture.manifest).unwrap();
     changed_manifest["files"][1]["sha256"] = Value::String(digest(changed_host.as_bytes()));
@@ -666,7 +737,14 @@ fn tampered_files_and_self_consistent_manifest_never_launch() {
         serde_json::to_vec(&changed_manifest).unwrap(),
     )
     .unwrap();
-    assert!(EngineChild::spawn(&fixture.engine(), &fixture.expected_digest).is_err());
+    assert!(
+        EngineChild::spawn(
+            &fixture.engine(),
+            &fixture.expected_digest,
+            &fixture.directory.join("data")
+        )
+        .is_err()
+    );
     assert!(!fixture.directory.join("started.txt").exists());
     fs::write(fixture.engine().join("host.mjs"), HOST).unwrap();
     fs::write(fixture.engine().join("manifest.json"), &fixture.manifest).unwrap();

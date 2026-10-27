@@ -3,7 +3,7 @@
 This runner uses the real uninstrumented Windows executable and its bundled Node
 engine through external `tauri-driver`. It never starts a dev server, substitutes
 IPC, adds capabilities or treats missing tools/app as a pass. It is the bootstrap
-unavailable/readiness and child-exit subset, not full TD-11 or UI qualification.
+native-core-ready/generation-unconfigured and child-exit subset, not full TD-11 or UI qualification.
 
 Run from the repository root after building the release app and staging its engine
 resources beside the executable. The preparation script rebuilds the pinned
@@ -26,10 +26,15 @@ identities, artifact hashes, failures and driver logs remain under ignored
 
 The production DOM must expose `data-connection-state` and validated
 `data-readiness-policy/store/receipts` on `[data-testid="app-shell"]`, an unavailable
-banner, and the native lifecycle's disconnected state with **Engine stopped**.
+banner headed **Generation unconfigured**, all three native core readiness values
+`true`, no workspace view, and disabled **Send** even with a nonempty draft. The
+native lifecycle's disconnected state must show **Engine stopped** and keep Send disabled.
 These reflect real application state; no test-only IPC is required. The native
-workspace dialog currently returns `POLICY_DENIED`; smoke checks this harmless
-command remains denied and the app remains unavailable. This does not qualify
+`send` command rejects the malformed `{op:'session.start',payload:{protocolVersion:0}}`
+arguments with `POLICY_DENIED` before forwarding to the engine. Smoke uses this
+no-dialog denial probe instead of opening the workspace picker, then rechecks the
+unconfigured state. These expectations target the protocol 2 native bootstrap
+checkpoint; the older core-unavailable app must fail. This does not qualify
 general filesystem/tool effects or native UIA accessibility.
 
 CI runs Pi's build-only `--hydrate-pinned` command before the offline build. It
@@ -81,6 +86,33 @@ The release runner checks driver archive and executable hashes before execution
 and records the app hash and runtime version. No tool downloads occur inside a
 smoke run.
 
+The separate `sreerevanth/td11-ci-portability` branch retains the failed CI
+comparison: two diagnostic smoke runs compare a new WebView2
+user-data folder with no additional browser arguments against another new folder
+with only `--disable-gpu`. Both use the same app and driver closure, capabilities,
+assertions and 20-second request budget. The `release-smoke-comparison` artifact
+labels each run and contains only the existing sanitized result and driver log.
+These runs do not change the primary failure or establish final acceptance; a
+passing fresh-profile baseline would also leave GPU causality unresolved.
+
+On failure, a read-only helper observes token elevation for each owned app process,
+checking its creation timestamp on the same process handle before reading its token.
+Inspection failure is `unknown`, never an unelevated result. The WebView diagnostic
+also records command count and booleans for `--disable-gpu` and an exact requested
+profile-folder match, without exporting command lines, process IDs or folder paths.
+Requested environment overrides alone do not prove uptake:
+[Microsoft documents that elevated hosts ignore WebView2 environment overrides](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/security#for-an-elevated-host-app-use-appropriate-override-flags).
+These observations do not change launch settings or establish the failure's cause.
+
+That portability branch also retains a **Documentation quality** token-observation
+job for manual dispatch. This native harness branch does not add those workflow
+jobs. The helper can run
+with `-Details` and records elevation type (1 default/no linked
+token, 2 full, 3 limited) and linked-token handle availability, then closes that
+handle. It never uses the token to launch a process or changes runner policy.
+These runner-process facts are prerequisites for evaluating a limited-token
+launch, not proof that such a launch works or that the packaged smoke passes.
+
 Self-check the fail-closed readiness assertions:
 
 ```powershell
@@ -88,7 +120,7 @@ node --test tests/bootstrap/release-smoke.test.mjs
 node --test tests/bootstrap/hydrate-pinned-model-data.test.mjs
 ```
 
-The embedded route still needs exact compatible WebdriverIO/service/test-plugin
-pins, a separate Cargo `e2e` feature and test-only capability/config, and proof
-these are absent from the release. Their integration belongs to the build owner;
-no guessed pins or broad automation permissions are added by this runner.
+The embedded route uses the build owner's WebdriverIO/service/test-plugin pins
+and separate Cargo `e2e` feature. Both embedded and external smoke must run on the
+same final native candidate; unit assertions do not qualify packaged behavior.
+This harness change adds no automation permissions or release capabilities.

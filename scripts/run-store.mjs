@@ -18,6 +18,8 @@ if (args.length === 0) {
     "tests/integration/receipts.ts",
     "tests/integration/bridge.ts",
     "tests/integration/config.ts",
+    "tests/integration/provider-profiles.ts",
+    "tests/integration/provider-profile-cas.ts",
     "tests/integration/crash-matrix.ts",
     "tests/integration/snapshots.ts",
     "tests/integration/events.ts",
@@ -35,7 +37,11 @@ if (args.length === 0) {
   else if (args[1] === "C3_crash_matrix")
     files = ["tests/integration/crash-matrix.ts"];
   else if (args[1] === "C4_config_transition")
-    files = ["tests/integration/config.ts"];
+    files = [
+      "tests/integration/config.ts",
+      "tests/integration/provider-profiles.ts",
+      "tests/integration/provider-profile-cas.ts",
+    ];
   else if (args[1] === "C5_dirty_snapshot")
     files = ["tests/integration/snapshots.ts"];
   else if (args[1] === "C6_event_ledger")

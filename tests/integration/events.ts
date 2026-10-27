@@ -30,7 +30,7 @@ const draft = (
   recordId = "source",
 ): SplyceEventDraft => ({
   schemaVersion: 1,
-  protocolVersion: 1,
+  protocolVersion: 2,
   eventId,
   recordId,
   createdAt: "2026-10-26T00:00:00.000Z",

@@ -17,7 +17,7 @@ test("transport request identity is bounded independently of payload size", () =
   const valid = {
     id: "native-1",
     method: "handshake",
-    params: { protocolVersion: 1 },
+    params: { protocolVersion: 2 },
   };
   assert.equal(isRequest(valid), true);
   assert.equal(isRequest({ ...valid, id: "a".repeat(129) }), false);
