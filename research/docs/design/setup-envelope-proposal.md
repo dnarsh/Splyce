@@ -26,6 +26,14 @@ Paths are relative to repo root. `file:line` are at c4df619 unless stated. Anyth
     - itachi-1824/codex maps the Store atomic setup commit with the lead; where this doc's 3-sequential-CAS flow differs, the lead/Codex mapping wins.
 
 ---
+11. LEAD RULINGS v4 (#12632975, 988aebbf; override sections 3-5 below where they conflict):
+    - (a) ONE atomic Store transaction: `Store.commitSetup(input, caller)` = endpoint + connection + profileSnapshot appended in a SINGLE `commitBatch` with entity-revision CAS on each (`expectedRevision` per entity, `null` for create), idempotent by `requestId`-derived recordIds. Replaces the 3 sequential CAS appends. OWNER: itachi-1824/claude (Store) on `Itachi-1824/td26-commit-setup` (off bootstrap 336dc28 + modelId e57b58e).
+    - (b) `provider.configure` renderer -> Rust: `{workspaceId, requestId, displayName (1..80), apiFamily: "openai-compatible", endpointUrl, apiKey, chatModelId, expected: {endpointRevision|null, connectionRevision|null, profileRevision|null}}`. Rust validates, writes `apiKey` to Windows Credential Manager under a generated Splyce target, STRIPS it, and forwards to Node: `{workspaceId, requestId, displayName, apiFamily, endpointUrl, credentialRef, bindings: [{role: "chat", modelId}], expected}`. Node canonicalizes the URL (`canonicalEndpointUrl`) and calls `commitSetup`. Unknown fields rejected; `apiKey` never logged/echoed; Rust-write-then-Node-commit outcome unknown -> read-back reconcile.
+    - (c) No automatic credential GC; deletion only on explicit user remove.
+    - (d) `canonicalUrl` keeps the base path; grants/render use `originView`.
+    - (e) A configured profile alone NEVER opens generation: it also requires an owned SDK session + tools + persistence sanitizer + grant dispatch.
+
+---
 ---
 
 ## 1. SETTLED existing contracts (read, cited)
