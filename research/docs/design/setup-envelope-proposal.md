@@ -17,6 +17,15 @@ Paths are relative to repo root. `file:line` are at c4df619 unless stated. Anyth
 7. Wire op string `"setup"` is CONFIRMED (matches frozen `frame:"setup"`).
 8. Persistence redaction (ruling #d55f6dbe, f0770fc4): ONE trusted native pre-append sanitizer = built-in pattern scrub + exact-match run in RUST via private `credential.redact` over ALL stored credentials. The engine never holds secrets for redaction (no per-session redaction scope). Fail closed with `PERSIST_REDACTION_UNAVAILABLE`. This supersedes any engine-held-secret variant. Exact authority/lifetime of the native matcher (established before the first user append, valid for late tool/transcript sinks after request revoke) is UNSETTLED detail owned by the native credential/persistence owners.
 
+9. SETTLED (09c7ff79): native credential matcher authority = Rust over Splyce-owned generated credential targets only; lifetime = native process, re-enumerated on every credential write/delete; fail closed on any inventory/decode error or stored key shorter than 8 chars (`PERSIST_REDACTION_UNAVAILABLE`); match forms raw/base64/base64url/hex/url/JSON-escaped.
+10. CORRECTIONS from itachi-1824/codex (67f68824; they override sections 3-5 below where they conflict):
+    - Wire op: `metadata` is committed as `op == command` under the existing `send` (c25b067). There is NO separate `op:"setup"` and NO new engine method: every setup command is `invoke("send", {op: <command>, payload})`; read `"setup"` in this doc as "the setup frame family", not an op string.
+    - `ConnectionSetupView` (anything the renderer receives, incl. the metadata `setup` field) MUST NOT contain `credentialRef` or `endpointRef` (staging #148 boundary): renderer gets ids, revisions, apiFamily, locality, displayName and `originView` (scheme+host+port) only.
+    - Credential lifecycle: NO destruction of historical keys and NO automatic rotation/15-min GC that makes pinned immutable profiles unselectable. Unknown/referenced credentials are PRESERVED. Replaces decision 13 / rule 5: a credential is deleted only by an explicit user action, and never while any profile revision that is selectable (effective or pinned) references it.
+    - Endpoint storage keeps `canonicalUrl` (normalized path included); `originView` is a separate renderer/grant-safe projection. Do not infer the Store only supports origins.
+    - itachi-1824/codex maps the Store atomic setup commit with the lead; where this doc's 3-sequential-CAS flow differs, the lead/Codex mapping wins.
+
+---
 ---
 
 ## 1. SETTLED existing contracts (read, cited)
