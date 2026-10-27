@@ -138,7 +138,7 @@ export interface WorkspaceToolsOptions {
   receipts: ReceiptPort;
   sessionId: string;
   workspaceId: string;
-  limits?: { timeoutMs: number; maxOutputBytes: number };
+  limits?: { timeoutMs: number; maxOutputBytes: number; now?: () => number };
   /** TD-16 redactor for active credentials; applied before the built-in scrub. */
   redact?: Redactor;
 }
@@ -329,6 +329,7 @@ export function createWorkspaceTools(
   const { workspaces, grants, receipts, sessionId, workspaceId } = opts;
   const timeoutMs = opts.limits?.timeoutMs ?? 120_000;
   const maxBytes = opts.limits?.maxOutputBytes ?? 50 * 1024;
+  const now = opts.limits?.now ?? Date.now;
   const first =
     workspaces.workspace(workspaceId) ??
     fail("WORKSPACE_UNKNOWN", "workspace is not admitted");
@@ -786,11 +787,11 @@ export function createWorkspaceTools(
         gate("fs.read", rel, a);
         const limit = optNum(args.limit, 1000);
         const hits: string[] = [];
-        const t0 = Date.now();
+        const t0 = now();
         await io(rel, async () => {
           for await (const e of walk(abs, rel === "" ? "" : rel)) {
             if (signal?.aborted) fail("ABORTED", "aborted");
-            if (Date.now() - t0 > timeoutMs)
+            if (now() - t0 > timeoutMs)
               fail("GREP_BUDGET", "search exceeded its time budget");
             if (re.test(glob.includes("/") ? e.rel : basename(e.rel)))
               hits.push(e.rel);

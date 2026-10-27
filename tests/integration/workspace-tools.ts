@@ -620,7 +620,8 @@ test("grep stops at a scanned-bytes budget and at a time budget", async () => {
     await codeOf(run(h, "grep", { pattern: "needle" })),
     "GREP_BUDGET",
   );
-  const t = harness({ timeoutMs: 1, maxOutputBytes: 1 << 20 });
+  let first = true;
+  const t = harness({ timeoutMs: 1, maxOutputBytes: 1 << 20, now: () => (first ? (first = false, 0) : 1000) });
   writeFileSync(join(t.root, "many.txt"), "line\n".repeat(150_000));
   assert.equal(
     await codeOf(run(t, "grep", { pattern: "needle" })),
