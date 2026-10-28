@@ -21,6 +21,8 @@
     stale = false,
     generationReady,
     workspaceSelected = false,
+    profileSelected = false,
+    sessionReadiness,
     unavailable,
     cancellable = false,
     contextArtifactIds = [],
@@ -34,6 +36,8 @@
     generationReady?: boolean;
     /** A project is selected; sending is blocked without one. */
     workspaceSelected?: boolean;
+    profileSelected?: boolean;
+    sessionReadiness?: "ready" | "unavailable";
     unavailable?: string;
     cancellable?: boolean;
     contextArtifactIds?: readonly string[];
@@ -53,6 +57,8 @@
       stale,
       generationReady,
       workspaceSelected,
+      profileSelected,
+      sessionReadiness,
       pending,
       unavailable,
     }),
@@ -67,6 +73,8 @@
       stale,
       generationReady,
       workspaceSelected,
+      profileSelected,
+      sessionReadiness,
       pending,
       unavailable,
     }))

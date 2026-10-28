@@ -62,7 +62,11 @@ beforeEach(() => {
   });
   ipc.ready = false;
   ipc.selection = null;
-  ipc.setup = async () => ({});
+  ipc.setup = async () => ({
+    profileId: "profile_1",
+    profileRevision: "pr_1",
+    configRevision: "cfg_1",
+  });
   ipc.invoke.mockImplementation(async (cmd: string, args?: unknown) => {
     if (cmd === "dialog_select_workspace") return ipc.selection;
     if (
@@ -237,11 +241,9 @@ describe("App wiring", () => {
     flushSync();
     const providers = q("[data-testid=providers-view]")!;
     expect(providers).not.toBeNull();
-    // No engine: the setup form is disabled with the port reason, not faked.
+    // No engine: the setup form is disabled until it connects.
     expect(button("Save provider").disabled).toBe(true);
-    expect(q("#setup-note")?.textContent).toContain(
-      "engine reports provider setup unavailable",
-    );
+    expect(q("#setup-note")?.textContent).toContain("engine is not connected");
     expect(
       providers.querySelector<HTMLFieldSetElement>("fieldset.custom")!.disabled,
     ).toBe(true);
@@ -390,9 +392,14 @@ describe("App wiring", () => {
     await settle();
     expect(button("Send").disabled).toBe(true);
     expect(q("#composer-status")?.textContent).toBe(
-      "Sending is not available yet",
+      "No profile is selected. Use a configured profile first.",
     );
-    expect(ipc.invoke.mock.calls.filter(([c]) => c === "send")).toHaveLength(0);
+    expect(
+      ipc.invoke.mock.calls.filter(
+        ([c, a]) =>
+          c === "send" && (a as { op: string }).op === "session.prompt",
+      ),
+    ).toHaveLength(0);
   });
 
   it("updates generation readiness dynamically without reconnect, clears ports on late exit, and preserves draft", async () => {
@@ -412,7 +419,7 @@ describe("App wiring", () => {
     // 1. Initial state: readyHandshake has generation: true -> honest wiring gap
     expect(button("Send").disabled).toBe(true);
     expect(q("#composer-status")?.textContent).toBe(
-      "Sending is not available yet",
+      "No profile is selected. Use a configured profile first.",
     );
 
     for (const missing of ["provider", "workspace"] as const) {
@@ -443,8 +450,14 @@ describe("App wiring", () => {
       await settle();
       expect(button("Send").disabled).toBe(true);
       expect(q("#composer-status")?.textContent).toContain(
-        "Generation unconfigured",
+        missing === "provider"
+          ? "Generation unconfigured"
+          : "No profile is selected",
       );
+      if (missing === "workspace")
+        expect(document.body.textContent).toContain(
+          "Workspace tools unavailable",
+        );
     }
 
     // 2. Dynamic engine.status event with generation: false without reconnect
@@ -508,7 +521,7 @@ describe("App wiring", () => {
 
     expect(button("Send").disabled).toBe(true);
     expect(q("#composer-status")?.textContent).toBe(
-      "Sending is not available yet",
+      "No profile is selected. Use a configured profile first.",
     );
     expect(ta.value).toBe("draft preserved across exit");
 
@@ -610,7 +623,7 @@ describe("App wiring", () => {
     expect(button("Send").disabled).toBe(true);
     await chooseProject();
     expect(q("#composer-status")?.textContent).toBe(
-      "Sending is not available yet",
+      "No profile is selected. Use a configured profile first.",
     );
   });
 
@@ -712,8 +725,7 @@ describe("App wiring", () => {
     const setupSends = () =>
       ipc.invoke.mock.calls.filter(
         ([c, a]) =>
-          c === "send" &&
-          (a as { payload: { frame?: string } }).payload.frame === "setup",
+          c === "send" && (a as { op: string }).op === "provider.configure",
       );
 
     it("requires a chosen project before the form can send", async () => {

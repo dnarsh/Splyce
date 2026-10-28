@@ -10,6 +10,7 @@ import {
   validateNativeSessionSetup,
 } from "../packages/splyce-pi/src/native-session-setup.mjs";
 import { NativeControl } from "../packages/splyce-pi/src/native-control.mjs";
+import { currentNativePolicyRevision } from "../packages/splyce-pi/dist/policy.js";
 import { Store } from "../packages/splyce-pi/dist/store.js";
 import { createNativeHost } from "../packages/splyce-pi/src/native-host.mjs";
 import {
@@ -163,7 +164,10 @@ test("setup does not invoke accessors or retain a mutable input object", () => {
 });
 
 // Real SQLite and NativeControl; only the parent protocol and factory port are fixtures.
-function serviceFixture(t) {
+function serviceFixture(
+  t,
+  currentPolicyRevision = currentNativePolicyRevision,
+) {
   const appDataDir = mkdtempSync(join(tmpdir(), "splyce-session-setup-"));
   const directory = join(appDataDir, "splyce");
   mkdirSync(directory);
@@ -345,7 +349,12 @@ function serviceFixture(t) {
       trace.push(`dispose:${reason}`);
     },
   };
-  const service = createNativeSessionSetup({ store, control, factory });
+  const service = createNativeSessionSetup({
+    store,
+    control,
+    factory,
+    currentPolicyRevision,
+  });
   t.after(async () => {
     await service.close();
     control.shutdown();
@@ -426,6 +435,7 @@ test("real setup service orders prepare, atomic commit and bind and projects pub
     "session.start",
   );
   assert.deepEqual(Object.keys(result).sort(), [
+    "policyRevision",
     "readiness",
     "sessionId",
     "sessionRevision",
@@ -508,6 +518,7 @@ test("real setup service replays stable identities and restores binding without 
   assert.deepEqual(await f.handle(input, "session.start"), first);
   assert.deepEqual(f.trace, ["prepare", "bind"]);
   const reopened = createNativeSessionSetup({
+    currentPolicyRevision: currentNativePolicyRevision,
     store: f.store,
     control: f.control,
     factory: f.factory,
@@ -524,6 +535,7 @@ test("real setup service keeps missing factory and private preparation failures 
   const selected = await f.handle(f.select());
   const before = f.store.list(f.workspaceId).records;
   const unavailable = createNativeSessionSetup({
+    currentPolicyRevision: currentNativePolicyRevision,
     store: f.store,
     control: f.control,
   });
@@ -609,6 +621,7 @@ test("ready replay rechecks genuine credential presence without minting another 
   assert.deepEqual(replay, {
     sessionId: first.sessionId,
     sessionRevision: first.sessionRevision,
+    policyRevision: currentNativePolicyRevision(f.workspaceId),
     readiness: { state: "unavailable", code: "SESSION_BIND_FAILED" },
   });
   assert.equal(f.frames.length, frames + 1);
@@ -698,6 +711,32 @@ test(
       ).ok,
       true,
     );
+    const readCursor = f.store.cursor();
+    const recovered = await rpc("read-rpc", "send", {
+      frame: "setup",
+      command: "setup.read",
+      requestId: "framed-read",
+      payload: { requestId: "framed-read", workspaceId: f.workspaceId },
+    });
+    assert.equal(recovered.ok, true);
+    assert.equal(
+      recovered.value.configRevision,
+      f.store.configRevision(f.workspaceId),
+    );
+    assert.equal(recovered.value.selectedProfileId, null);
+    assert.deepEqual(
+      recovered.value.profiles,
+      ["a", "b"].map((name) => ({
+        profileId: `profile-${name}`,
+        profileRevision: "p1",
+        apiFamily: "openai-completions",
+        modelId: "fixture-model",
+        endpointOrigin: `https://${name}.example.test`,
+        credential: "configured",
+      })),
+    );
+    assert.equal(f.store.cursor(), readCursor);
+    assert.deepEqual(f.trace, []);
     const selection = f.select("framed-select");
     const selected = await rpc("select-rpc", "send", {
       frame: "setup",
@@ -738,3 +777,44 @@ test(
     assert.equal(pending.size, 0);
   },
 );
+
+test("setup projects refreshed Store policy witnesses for ready, replay and unavailable results", async (t) => {
+  let revision = "12";
+  const f = serviceFixture(t, () => revision);
+  const selected = await f.handle(f.select());
+  const request = f.run("policy-refresh", selected.configRevision);
+  const first = await f.handle(request, "session.start");
+  assert.equal(first.policyRevision, "12");
+  const before = f.store.list(f.workspaceId).records;
+  revision = "13";
+  const replay = await f.handle(request, "session.start");
+  assert.equal(replay.policyRevision, "13");
+  assert.equal(replay.sessionId, first.sessionId);
+  assert.deepEqual(f.store.list(f.workspaceId).records, before);
+  revision = "14";
+  f.state.present = false;
+  const unavailable = await f.handle(request, "session.start");
+  assert.equal(unavailable.policyRevision, "14");
+  assert.equal(unavailable.readiness.code, "SESSION_BIND_FAILED");
+  revision = "15";
+  const failedReplay = await f.handle(request, "session.start");
+  assert.equal(failedReplay.policyRevision, "15");
+  assert.equal(failedReplay.sessionId, first.sessionId);
+  assert.equal(failedReplay.readiness.code, "SESSION_BIND_FAILED");
+});
+
+test("bind failure projects the policy witness captured by its compensation transaction", async (t) => {
+  let revision = "21";
+  const f = serviceFixture(t, () => revision);
+  const selected = await f.handle(f.select());
+  f.state.onBind = async () => {
+    revision = "22";
+  };
+  f.state.failBind = true;
+  const failed = await f.handle(
+    f.run("policy-bind-failure", selected.configRevision),
+    "session.start",
+  );
+  assert.equal(failed.policyRevision, "22");
+  assert.equal(failed.readiness.code, "SESSION_BIND_FAILED");
+});

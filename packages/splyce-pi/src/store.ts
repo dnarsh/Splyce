@@ -399,6 +399,7 @@ export interface NativeProfileSelectionResult {
 export interface NativeSessionStartResult {
   sessionId: string;
   sessionRevision: string;
+  policyRevision: string;
   readiness: { state: "unavailable"; code?: "SESSION_BIND_FAILED" };
 }
 export type NativeBranchAnchor = Pick<
@@ -423,6 +424,11 @@ export interface NativeSessionSetupCommit<
   replayed: boolean;
   branchAnchor?: NativeBranchAnchor;
 }
+type NativeSetupStoredCommit = NativeSessionSetupCommit<
+  | NativeProfileSelectionResult
+  | Omit<NativeSessionStartResult, "policyRevision">
+>;
+
 export interface NativeSessionSetupPreparation {
   command: NativeSessionSetupCommand;
   request: Readonly<NativeSessionSetupRequest>;
@@ -430,7 +436,7 @@ export interface NativeSessionSetupPreparation {
   profile: RecordByKind["profileSnapshot"];
   bindings: readonly NativeSetupBinding[];
   origins: readonly string[];
-  replay?: NativeSessionSetupCommit;
+  replay?: NativeSetupStoredCommit;
 }
 interface NativeSetupReceipt {
   version: 1;
@@ -1080,6 +1086,7 @@ export class Store {
     prepared:
       { piSessionId: string; branchAnchor: NativeBranchAnchor } | undefined,
     caller: CallerContext,
+    currentPolicyRevision: (workspaceId: string) => string,
   ): NativeSessionSetupCommit<NativeSessionStartResult> {
     if (this.nativeSetupCaptures.get(preparation)?.command !== "session.start")
       nativeSetupInvalid();
@@ -1087,6 +1094,7 @@ export class Store {
       preparation,
       prepared,
       caller,
+      currentPolicyRevision,
     ) as NativeSessionSetupCommit<NativeSessionStartResult>;
   }
 
@@ -1574,7 +1582,7 @@ export class Store {
   private nativeSetupReplay(
     receipt: NativeSetupReceipt,
     replayed: boolean,
-  ): NativeSessionSetupCommit {
+  ): NativeSetupStoredCommit {
     const workspaceId = receipt.request.workspaceId;
     const state = this.readSetupStateLocked(workspaceId);
     const profile = this.nativeSetupRecord(
@@ -1717,11 +1725,32 @@ export class Store {
     return anchor as unknown as NativeBranchAnchor;
   }
 
+  private nativeSetupPolicyRevision(
+    currentPolicyRevision: ((workspaceId: string) => string) | undefined,
+    workspaceId: string,
+  ): string {
+    if (typeof currentPolicyRevision !== "function") nativeSetupInvalid();
+    let revision: unknown;
+    try {
+      revision = currentPolicyRevision(workspaceId);
+    } catch {
+      nativeSetupInvalid();
+    }
+    if (
+      typeof revision !== "string" ||
+      revision.length > 128 ||
+      !/^(0|[1-9][0-9]*)$/u.test(revision)
+    )
+      nativeSetupInvalid();
+    return revision;
+  }
+
   private commitNativeSessionSetup(
     preparation: NativeSessionSetupPreparation,
     prepared:
       { piSessionId: string; branchAnchor: NativeBranchAnchor } | undefined,
     caller: CallerContext,
+    currentPolicyRevision?: (workspaceId: string) => string,
   ): NativeSessionSetupCommit {
     const capture = this.nativeSetupCaptures.get(preparation);
     if (
@@ -1770,6 +1799,7 @@ export class Store {
       receipt: NativeSetupReceipt | undefined;
     let authority: NativeSetupAuthority | undefined;
     let seqs: number[];
+    let policyRevision: string | undefined;
     try {
       ({ seqs } = this.commitBatch([], [], batchCaller, {
         expectedConfigRevision: {
@@ -1777,6 +1807,11 @@ export class Store {
           revision: request.expectedConfigRevision,
         },
         nativeSetup: () => {
+          if (command === "session.start")
+            policyRevision = this.nativeSetupPolicyRevision(
+              currentPolicyRevision,
+              request.workspaceId,
+            );
           if (!this.currentWorkspace(request.workspaceId))
             nativeSetupInvalid("WORKSPACE_SUPERSEDED");
           const prior = this.nativeSetupReceipt(receiptId);
@@ -1786,7 +1821,14 @@ export class Store {
               JSON.stringify(prior.request) !== JSON.stringify(request)
             )
               nativeSetupInvalid("SETUP_REQUEST_CONFLICT");
-            replay = this.nativeSetupReplay(prior, true);
+            const stored = this.nativeSetupReplay(prior, true);
+            replay = {
+              ...stored,
+              result:
+                command === "session.start"
+                  ? { ...stored.result, policyRevision: policyRevision! }
+                  : stored.result,
+            } as NativeSessionSetupCommit;
             throw new StoreError(
               "NATIVE_SETUP_REPLAY",
               "Native setup already committed",
@@ -1949,6 +1991,7 @@ export class Store {
               result: {
                 sessionId: piSessionId!,
                 sessionRevision: String(seqs[0]),
+                policyRevision: policyRevision!,
                 readiness: { state: "unavailable" as const },
               },
             },
@@ -2087,6 +2130,7 @@ export class Store {
   failNativeSessionStart(
     input: { workspaceId: string; sessionId: string; sessionRevision: string },
     caller: CallerContext,
+    currentPolicyRevision: (workspaceId: string) => string,
   ): NativeSessionSetupCommit<NativeSessionStartResult> {
     const fields = ["workspaceId", "sessionId", "sessionRevision"];
     if (
@@ -2116,6 +2160,10 @@ export class Store {
       this.nativeSetupCaller(caller, workspaceId, staged, sessionId),
       {
         nativeSetup: () => {
+          const policyRevision = this.nativeSetupPolicyRevision(
+            currentPolicyRevision,
+            workspaceId,
+          );
           const rows = this.db
             .prepare(
               "SELECT record_id FROM records WHERE scope_id = ? AND kind = 'artifact' AND json_extract(payload, '$.mediaType') = ? AND json_extract(payload, '$.nativeSetup.sessionId') = ?",
@@ -2167,6 +2215,7 @@ export class Store {
             result: {
               sessionId,
               sessionRevision: String(anchorRow.seq),
+              policyRevision,
               readiness: { state: "unavailable" },
             },
           };

@@ -10,6 +10,8 @@ type Props = {
   stale?: boolean;
   generationReady?: boolean;
   workspaceSelected?: boolean;
+  profileSelected?: boolean;
+  sessionReadiness?: "ready" | "unavailable";
   cancellable?: boolean;
   contextArtifactIds?: string[];
   send: (p: PromptPayload) => Promise<void>;
@@ -32,6 +34,8 @@ function setup(over: Partial<Props> = {}) {
     // to generationReady: false explicitly.
     generationReady: true,
     workspaceSelected: true,
+    profileSelected: true,
+    sessionReadiness: "ready",
     send,
     cancel,
     ...over,

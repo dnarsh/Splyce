@@ -1,3 +1,4 @@
+import { currentNativePolicyRevision } from "../packages/splyce-pi/dist/policy.js";
 // Real provider-setup producer joined to native selection/start on SQLite.
 // Credential references and Pi IDs qualify metadata/storage only: no NativeControl,
 // Credential Manager, secret, model request, or installed factory is involved.
@@ -207,6 +208,7 @@ test("native provider commit/read/replay output supplies real descriptors for se
       }),
       piMetadata("pi-producer-storage-fixture"),
       f.caller,
+      currentNativePolicyRevision,
     );
     assert.equal(started.result.sessionId, "pi-producer-storage-fixture");
     assert.deepEqual(started.result.readiness, { state: "unavailable" });

@@ -155,9 +155,18 @@ test("awaited native registration publishes genuine nonsecret presence and forwa
   await registration;
   assert.equal(f.runtime.hasConfiguredAuth("openai"), true);
   assert.deepEqual(await f.runtime.getAvailable(), [f.model]);
+  const framesBefore = f.frames.length;
+  assert.equal(
+    (await f.runtime.completeSimple(f.model, context, { maxTokens: 8 }))
+      .stopReason,
+    "error",
+  );
+  assert.equal(f.frames.length, framesBefore);
+  assert.equal(f.calls.length, 0);
+  const signal = new AbortController().signal;
   for (const method of ["complete", "completeSimple"]) {
     const result = await f.runtime[method]({ ...f.model }, context, {
-      maxTokens: 8,
+      signal,
     });
     assert.equal(result.content[0].text, "native callback");
   }
@@ -167,7 +176,7 @@ test("awaited native registration publishes genuine nonsecret presence and forwa
     assert.equal(call.requestOptions.apiKey, undefined);
     assert.equal(call.requestOptions.credentials, undefined);
     assert.equal(call.requestOptions.env, undefined);
-    assert.equal(call.requestOptions.maxTokens, 8);
+    assert.equal(call.requestOptions.signal, signal);
     assert.equal(call.transcript.messages[0].content, "hello");
   }
   await assert.rejects(f.runtime.getAuth(f.model), unavailable);
@@ -291,7 +300,7 @@ test("caller mutation while status awaits cannot add overrides or alter the regi
     entered.resolve();
     await release.promise;
   });
-  const options = { maxTokens: 8 };
+  const options = { signal: new AbortController().signal };
   const selected = { ...f.model };
   const request = f.runtime.completeSimple(selected, context, options);
   await entered.promise;
@@ -338,7 +347,7 @@ registerHooks({ load(url, context, next) {
   const targets = {
     current: ['requireNativeProvider(providerId, expected) {\\n        assertSameSplyceOwner(this, this, "model-runtime");', 'requireNativeProvider(providerId, expected) {'],
     endpoint: ['selected.baseUrl !== model.baseUrl ||', ''],
-    overrides: ['if (providerOptions[name] !== undefined)', 'if (false)'],
+    overrides: ['Reflect.ownKeys(options).some((key) => key !== "signal")', 'false'],
     presence: ['if (!(await this.checkAuth(provider.id, { signal: providerOptions.signal })))', 'if (false)'],
   };
   const [from, to] = targets[process.env.SPLYCE_MODEL_RUNTIME_TARGET];

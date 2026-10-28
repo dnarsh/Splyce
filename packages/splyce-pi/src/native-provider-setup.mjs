@@ -193,6 +193,9 @@ export function createNativeProviderSetup(store, directory) {
           maxRetries: 0,
           redirects: "denied",
           maxEncodedFrameBytes: TRANSPORT_LIMITS.maxEncodedFrameBytes,
+          maxRequestBytes: 4_194_304,
+          headersTimeoutMs: 10_000,
+          maxSseEventBytes: 1_048_576,
         },
       ],
       [

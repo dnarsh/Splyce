@@ -4,6 +4,7 @@
   import CustomEndpointForm from "../components/provider/CustomEndpointForm.svelte";
   import {
     groupByFamily,
+    type ConfiguredProfile,
     type ConnectionInput,
     type CustomEndpointDraft,
     type ProviderSetupDraft,
@@ -15,6 +16,12 @@
     onAddCustom,
     credentialSubmit,
     credentialUnavailable,
+    profiles = [],
+    workspaceSelected = false,
+    selectedProfileId = null,
+    selectProfile,
+    profilePending = false,
+    profileStatus = null,
   }: {
     connections: readonly ConnectionInput[];
     families: readonly string[];
@@ -23,6 +30,12 @@
     /** Injected once the native setup route is available; omitted means unavailable. */
     credentialSubmit?: (draft: ProviderSetupDraft) => Promise<void>;
     credentialUnavailable?: string;
+    profiles?: readonly ConfiguredProfile[];
+    workspaceSelected?: boolean;
+    selectedProfileId?: string | null;
+    selectProfile?: (profile: ConfiguredProfile) => Promise<void>;
+    profilePending?: boolean;
+    profileStatus?: string | null;
   } = $props();
 
   const groups = $derived(groupByFamily(connections, families));
@@ -36,7 +49,44 @@
 
 <main aria-labelledby="providers-title">
   <h2 id="providers-title">Provider connections</h2>
-  <CredentialForm submit={credentialSubmit} unavailableReason={credentialUnavailable} />
+  <CredentialForm
+    submit={credentialSubmit}
+    unavailableReason={credentialUnavailable}
+  />
+  <section aria-labelledby="configured-profiles-title">
+    <h3 id="configured-profiles-title">Configured profiles</h3>
+    {#if profiles.length === 0}
+      <p>No configured profile metadata is available for this project.</p>
+    {/if}
+    {#each profiles as profile (profile.profileId)}
+      <div>
+        <span
+          >{profile.profileId}{selectedProfileId === profile.profileId
+            ? " (selected)"
+            : ""}</span
+        >
+        {#if profile.credential}
+          <span>{profile.apiFamily} · {profile.modelId} · {profile.endpointOrigin} · Credential {profile.credential}</span>
+        {/if}
+        <button
+          type="button"
+          disabled={profile.credential === "missing" || !workspaceSelected ||
+            !selectProfile ||
+            profilePending ||
+            !credentialSubmit}
+          aria-describedby="profile-status"
+          onclick={() => void selectProfile?.(profile)}
+        >
+          Use this profile
+        </button>
+      </div>
+    {/each}
+    <p id="profile-status" role="status">
+      {!workspaceSelected
+        ? "Choose a project before selecting a profile."
+        : profileStatus}
+    </p>
+  </section>
   {#each groups as group (group.apiFamily)}
     <section aria-labelledby={`fam-${group.apiFamily}`} data-testid="family">
       <h3 id={`fam-${group.apiFamily}`}>{group.apiFamily}</h3>
@@ -60,5 +110,13 @@
 </main>
 
 <style>
-  .custom { border: 0; margin: 0; padding: 0; }
+  .custom {
+    border: 0;
+    margin: 0;
+    padding: 0;
+  }
+  button:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+  }
 </style>

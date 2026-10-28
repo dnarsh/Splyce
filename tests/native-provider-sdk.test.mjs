@@ -93,8 +93,12 @@ async function fixture(t, options = {}) {
         res.writeHead(302, { location: "/elsewhere" });
         res.end();
       } else {
-        res.writeHead(200, { "content-type": "text/event-stream" });
-        res.write(sse(options.text ?? "hello", !options.noTerminal));
+        res.writeHead(options.status ?? 200, {
+          "content-type": options.contentType ?? "text/event-stream",
+        });
+        res.write(
+          options.raw ?? sse(options.text ?? "hello", !options.noTerminal),
+        );
         if (options.finish) options.finish(res);
         else res.end();
       }
@@ -694,6 +698,69 @@ test("native provider rejects forged scope and failed credential close", async (
   );
 });
 
+test("native adapter rejects hidden and inherited options before admission", async (t) => {
+  const model = {
+    api: "openai-completions",
+    id: "fixture-model",
+    name: "Fixture",
+    provider: "openai",
+    baseUrl: "http://127.0.0.1",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 8192,
+    maxTokens: 1024,
+  };
+  const f = await fixture(t, { model });
+  let admissions = 0,
+    getters = 0;
+  const provider = createNativeModelProvider({
+    model,
+    credentialRef: target,
+    control: f.control,
+    requests: f.owner,
+    admit: async () => {
+      admissions++;
+      return f.scope;
+    },
+    assertCurrent() {},
+  });
+  const accessor = Object.defineProperty({}, "signal", {
+    enumerable: true,
+    get() {
+      getters++;
+      return undefined;
+    },
+  });
+  for (const options of [
+    Object.create({ temperature: 0.5 }),
+    Object.defineProperty({}, "temperature", { value: 0.5 }),
+    { [Symbol("semantic")]: true },
+    accessor,
+    [],
+  ]) {
+    assert.equal(
+      (await provider.stream(model, f.semantic.context, options).result())
+        .stopReason,
+      "error",
+    );
+  }
+  assert.equal(admissions, 0);
+  assert.equal(getters, 0);
+  assert.equal(f.received, 0);
+  assert.equal(f.frames.includes("credential.read"), false);
+  const options = Object.assign(Object.create(null), {
+    signal: f.controller.signal,
+  });
+  assert.equal(
+    (await provider.stream(model, f.semantic.context, options).result())
+      .stopReason,
+    "stop",
+  );
+  assert.equal(admissions, 1);
+  assert.equal(f.received, 1);
+});
+
 test("native provider status uses private control and cancellation prevents admission", async (t) => {
   const model = {
     api: "openai-completions",
@@ -774,12 +841,17 @@ test("sealed ModelRuntime composes the native provider with real policy, credent
   };
   owner.bind(options, "model-runtime-options");
   const runtime = await ModelRuntime.create(options);
+  let admissions = 0,
+    getters = 0;
   const provider = createNativeModelProvider({
     model,
     credentialRef: target,
     control: f.control,
     requests: f.owner,
-    admit: async () => f.scope,
+    admit: async () => {
+      admissions++;
+      return f.scope;
+    },
     assertCurrent() {},
   });
   const previous = process.env.OPENAI_API_KEY;
@@ -814,9 +886,38 @@ test("sealed ModelRuntime composes the native provider with real policy, credent
     );
     assert.equal(f.received, 0);
   }
-  const stream = runtime.streamSimple(model, context, {
+  const aborted = new AbortController();
+  aborted.abort();
+  const accessor = Object.defineProperty({}, "signal", {
+    enumerable: true,
+    get() {
+      getters++;
+      return f.controller.signal;
+    },
+  });
+  const framesBefore = f.frames.length;
+  for (const requestOptions of [
+    Object.create({ signal: aborted.signal }),
+    Object.create({ temperature: 0.5 }),
+    Object.defineProperty({}, "temperature", { value: 0.5 }),
+    accessor,
+    { [Symbol("semantic")]: true },
+    [],
+  ]) {
+    assert.equal(
+      (await runtime.streamSimple(model, context, requestOptions).result())
+        .stopReason,
+      "error",
+    );
+    assert.equal(admissions, 0);
+    assert.equal(getters, 0);
+    assert.equal(f.received, 0);
+    assert.equal(f.frames.length, framesBefore);
+  }
+  const requestOptions = Object.assign(Object.create(null), {
     signal: f.controller.signal,
   });
+  const stream = runtime.streamSimple(model, context, requestOptions);
   const events = [];
   for await (const event of stream) events.push(event);
   assert.equal(events.at(-1).type, "done");
@@ -826,9 +927,366 @@ test("sealed ModelRuntime composes the native provider with real policy, credent
     { role: "user", content: "hello" },
   ]);
   assert.equal(f.received, 1);
+  assert.equal(admissions, 1);
   assert.equal(
     f.frames.filter((frame) => frame === "credential.scope.close").length,
     1,
   );
   assert.equal(outcomes(f)[0].record.effectState, "observed-success");
+});
+
+test("native provider bounds each raw SSE event and preserves larger valid streams", async (t) => {
+  const model = {
+    api: "openai-completions",
+    id: "fixture-model",
+    name: "Fixture",
+    provider: "openai",
+    baseUrl: "http://127.0.0.1",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 8192,
+    maxTokens: 1024,
+  };
+  const oversized = "data: " + "x".repeat(1048576);
+  let cancelled = false;
+  const physicalFetch = globalThis.fetch;
+  globalThis.fetch = async (...args) => {
+    const response = await physicalFetch(...args);
+    return new Proxy(response, {
+      get(target, property) {
+        if (property === "body")
+          return new Proxy(target.body, {
+            get(body, key) {
+              if (key === "getReader")
+                return (...args) => {
+                  const reader = body.getReader(...args);
+                  return new Proxy(reader, {
+                    get(active, name) {
+                      if (name === "cancel")
+                        return async (...args) => {
+                          await active.cancel(...args);
+                          cancelled = true;
+                        };
+                      const value = Reflect.get(active, name, active);
+                      return typeof value === "function"
+                        ? value.bind(active)
+                        : value;
+                    },
+                  });
+                };
+              const value = Reflect.get(body, key, body);
+              return typeof value === "function" ? value.bind(body) : value;
+            },
+          });
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = physicalFetch;
+  });
+  const f = await fixture(t, {
+    model,
+    raw: oversized,
+    finish: () => {},
+    close: () =>
+      assert.equal(
+        cancelled,
+        true,
+        "physical cancel precedes credential close",
+      ),
+  });
+  const provider = createNativeModelProvider({
+    model,
+    credentialRef: target,
+    control: f.control,
+    requests: f.owner,
+    admit: async () => f.scope,
+    assertCurrent() {},
+  });
+  const stream = provider.stream(model, f.semantic.context);
+  const events = [];
+  const reading = (async () => {
+    for await (const event of stream) events.push(event);
+  })();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    f.controller.abort();
+  }, 1000);
+  try {
+    await reading;
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.equal(timedOut, false, "oversized event must fail before timeout");
+  assert.equal(
+    cancelled,
+    true,
+    "oversized event must physically cancel before timeout",
+  );
+  assert.equal((await stream.result()).stopReason, "error");
+  assert.equal(
+    events.some((event) => event.type === "done"),
+    false,
+  );
+  assert.equal(
+    outcomes(f).some((r) => r.record.effectState === "observed-success"),
+    false,
+  );
+});
+
+test("native provider accepts CRLF multi-line events and total streams over the event limit", async (t) => {
+  const model = {
+    api: "openai-completions",
+    id: "fixture-model",
+    name: "Fixture",
+    provider: "openai",
+    baseUrl: "http://127.0.0.1",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 8192,
+    maxTokens: 1024,
+  };
+  const frame = sse("ok").split("\n\n")[0];
+  const raw =
+    (
+      ":" +
+      "c".repeat(2000) +
+      "\r\n" +
+      frame.replace("data: ", "data: \r\ndata: ") +
+      "\r\n\r\n"
+    ).repeat(550) + sse([], true).replaceAll("\n", "\r\n");
+  assert.ok(Buffer.byteLength(raw) > 1048576);
+  const f = await fixture(t, { model, raw });
+  const provider = createNativeModelProvider({
+    model,
+    credentialRef: target,
+    control: f.control,
+    requests: f.owner,
+    admit: async () => f.scope,
+    assertCurrent() {},
+  });
+  const result = await provider.stream(model, f.semantic.context).result();
+  assert.equal(result.stopReason, "stop");
+  assert.equal(outcomes(f)[0].record.effectState, "observed-success");
+});
+
+for (const [name, response] of [
+  [
+    "CRLF multi-line event",
+    {
+      raw:
+        ": fixture\r\ndata: " +
+        "x".repeat(600000) +
+        "\r\ndata: " +
+        "y".repeat(500000),
+    },
+  ],
+  [
+    "non-SSE error body",
+    {
+      status: 400,
+      contentType: "application/json",
+      raw: "{" + "x".repeat(1100000),
+    },
+  ],
+  [
+    "SSE error body with many small events",
+    { status: 400, raw: "x\n\n".repeat(400000) },
+  ],
+]) {
+  test(`native provider rejects oversized ${name} before credential close`, async (t) => {
+    const model = {
+      api: "openai-completions",
+      id: "fixture-model",
+      name: "Fixture",
+      provider: "openai",
+      baseUrl: "http://127.0.0.1",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 8192,
+      maxTokens: 1024,
+    };
+    let cancelled = false;
+    const physicalFetch = globalThis.fetch;
+    globalThis.fetch = async (...args) => {
+      const original = await physicalFetch(...args);
+      return new Proxy(original, {
+        get(target, property) {
+          if (property === "body")
+            return new Proxy(target.body, {
+              get(body, key) {
+                if (key === "cancel")
+                  return async (...args) => {
+                    await body.cancel(...args);
+                    cancelled = true;
+                  };
+                if (key === "getReader")
+                  return (...args) => {
+                    const reader = body.getReader(...args);
+                    return new Proxy(reader, {
+                      get(active, name) {
+                        if (name === "cancel")
+                          return async (...args) => {
+                            await active.cancel(...args);
+                            cancelled = true;
+                          };
+                        const value = Reflect.get(active, name, active);
+                        return typeof value === "function"
+                          ? value.bind(active)
+                          : value;
+                      },
+                    });
+                  };
+                const value = Reflect.get(body, key, body);
+                return typeof value === "function" ? value.bind(body) : value;
+              },
+            });
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    };
+    t.after(() => {
+      globalThis.fetch = physicalFetch;
+    });
+    const f = await fixture(t, {
+      ...response,
+      model,
+      finish: () => {},
+      close: () =>
+        assert.equal(
+          cancelled,
+          true,
+          "physical cancellation precedes credential close",
+        ),
+    });
+    const provider = createNativeModelProvider({
+      model,
+      credentialRef: target,
+      control: f.control,
+      requests: f.owner,
+      admit: async () => f.scope,
+      assertCurrent() {},
+    });
+    const stream = provider.stream(model, f.semantic.context);
+    const events = [];
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      f.controller.abort();
+    }, 1000);
+    try {
+      for await (const event of stream) events.push(event);
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(timedOut, false, "rejection must precede the test timeout");
+    assert.equal(cancelled, true);
+    assert.equal((await stream.result()).stopReason, "error");
+    assert.equal(
+      events.some((event) => event.type === "done"),
+      false,
+    );
+    assert.equal(
+      outcomes(f).some((r) => r.record.effectState === "observed-success"),
+      false,
+    );
+  });
+}
+
+test("native provider closes credential after rejected upstream cancellation without success", async (t) => {
+  const model = {
+    api: "openai-completions",
+    id: "fixture-model",
+    name: "Fixture",
+    provider: "openai",
+    baseUrl: "http://127.0.0.1",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 8192,
+    maxTokens: 1024,
+  };
+  let cancelRejected = false;
+  const physicalFetch = globalThis.fetch;
+  globalThis.fetch = async (...args) => {
+    const original = await physicalFetch(...args);
+    return new Proxy(original, {
+      get(target, property) {
+        if (property === "body")
+          return new Proxy(target.body, {
+            get(body, key) {
+              if (key === "getReader")
+                return (...args) => {
+                  const reader = body.getReader(...args);
+                  return new Proxy(reader, {
+                    get(active, name) {
+                      if (name === "cancel")
+                        return async () => {
+                          cancelRejected = true;
+                          throw new Error("fixture cancellation failure");
+                        };
+                      const value = Reflect.get(active, name, active);
+                      return typeof value === "function"
+                        ? value.bind(active)
+                        : value;
+                    },
+                  });
+                };
+              const value = Reflect.get(body, key, body);
+              return typeof value === "function" ? value.bind(body) : value;
+            },
+          });
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = physicalFetch;
+  });
+  const f = await fixture(t, {
+    model,
+    raw: "data: " + "x".repeat(1100000),
+    finish: () => {},
+    close: () =>
+      assert.equal(
+        cancelRejected,
+        true,
+        "cancel rejection precedes credential close",
+      ),
+  });
+  const provider = createNativeModelProvider({
+    model,
+    credentialRef: target,
+    control: f.control,
+    requests: f.owner,
+    admit: async () => f.scope,
+    assertCurrent() {},
+  });
+  const stream = provider.stream(model, f.semantic.context);
+  const events = [];
+  const timer = setTimeout(() => f.controller.abort(), 1000);
+  try {
+    for await (const event of stream) events.push(event);
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.equal(cancelRejected, true);
+  assert.equal(f.frames.at(-1), "credential.scope.close");
+  assert.equal((await stream.result()).stopReason, "error");
+  assert.equal(
+    events.some((event) => event.type === "done"),
+    false,
+  );
+  assert.equal(
+    outcomes(f).some((r) => r.record.effectState === "observed-success"),
+    false,
+  );
 });

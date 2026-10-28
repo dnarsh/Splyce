@@ -118,14 +118,18 @@ export class NativeControl {
       if (
         !exact(reply, ["id", "ok", "error"]) ||
         !exact(reply.error, ["code"]) ||
-        !["CREDENTIAL_UNAVAILABLE", "PERSIST_REDACTION_UNAVAILABLE"].includes(
-          reply.error.code,
-        ) ||
+        ![
+          "CREDENTIAL_UNAVAILABLE",
+          "PERSIST_REDACTION_UNAVAILABLE",
+          "INVENTORY_UNAVAILABLE",
+        ].includes(reply.error.code) ||
         (pending &&
           reply.error.code !==
-            (pending.method === "credential.redact"
-              ? "PERSIST_REDACTION_UNAVAILABLE"
-              : "CREDENTIAL_UNAVAILABLE"))
+            (pending.method === "inventory.capture"
+              ? "INVENTORY_UNAVAILABLE"
+              : pending.method === "credential.redact"
+                ? "PERSIST_REDACTION_UNAVAILABLE"
+                : "CREDENTIAL_UNAVAILABLE"))
       )
         return fail();
       pending?.finish(true);
@@ -148,19 +152,47 @@ export class NativeControl {
       Number.isSafeInteger(reply.value.redactedCount) &&
       reply.value.redactedCount >= 0 &&
       fitsFrame(frame);
+    const isInventory =
+      exact(reply.value, ["manifest"]) &&
+      reply.value.manifest &&
+      typeof reply.value.manifest === "object" &&
+      fitsFrame(frame);
     if (
-      (!isEmpty && !isSecret && !isRedaction && !isStatus) ||
+      (!isEmpty && !isSecret && !isRedaction && !isStatus && !isInventory) ||
       (pending &&
-        (pending.method === "credential.read"
-          ? !isSecret
-          : pending.method === "credential.redact"
-            ? !isRedaction
-            : pending.method === "credential.status"
-              ? !isStatus
-              : !isEmpty))
+        (pending.method === "inventory.capture"
+          ? !isInventory
+          : pending.method === "credential.read"
+            ? !isSecret
+            : pending.method === "credential.redact"
+              ? !isRedaction
+              : pending.method === "credential.status"
+                ? !isStatus
+                : !isEmpty))
     )
       return fail();
     pending?.finish(false, reply.value);
+  }
+
+  async inventory(workspace, signal) {
+    const { canonicalPath, volumeSerial, fileId } = workspace;
+    if (
+      typeof canonicalPath !== "string" ||
+      typeof volumeSerial !== "string" ||
+      typeof fileId !== "string"
+    )
+      throw unavailable();
+    try {
+      return await this.#call(
+        "inventory.capture",
+        { canonicalPath, volumeSerial, fileId },
+        signal,
+      );
+    } catch {
+      throw Object.assign(new Error("Inventory unavailable"), {
+        code: "INVENTORY_UNAVAILABLE",
+      });
+    }
   }
 
   async credentialStatus(params, signal) {

@@ -45,8 +45,18 @@ export function createNativeModelProvider({
   const stream = (selected, context, options = {}) => {
     let input;
     try {
-      const { signal, ...rest } = options;
-      if (Object.keys(rest).length) throw failure();
+      if (options === null || typeof options !== "object") throw failure();
+      const prototype = Object.getPrototypeOf(options);
+      if (
+        (prototype !== null && prototype !== Object.prototype) ||
+        Reflect.ownKeys(options).some((key) => key !== "signal")
+      )
+        throw failure();
+      const descriptor = Object.getOwnPropertyDescriptor(options, "signal");
+      if (descriptor && !Object.hasOwn(descriptor, "value")) throw failure();
+      const signal = descriptor?.value;
+      if (signal !== undefined && !(signal instanceof AbortSignal))
+        throw failure();
       input = {
         model: structuredClone(selected),
         context: structuredClone(context),
@@ -79,7 +89,16 @@ export function createNativeModelProvider({
         try {
           let terminal;
           const result = await runNativeOpenAIChat({
-            port: requests.port,
+            port: {
+              withRequest: (scope, consume) =>
+                requests.port.withRequest(scope, (request) =>
+                  consume({
+                    ...request,
+                    fetch: async (...args) =>
+                      limitResponse(await request.fetch(...args)),
+                  }),
+                ),
+            },
             scope,
             model: semantic.options.model,
             context: semantic.context,
@@ -145,4 +164,94 @@ export function createNativeModelProvider({
     stream,
     streamSimple: stream,
   };
+}
+const MAX_EVENT_BYTES = 1048576;
+
+async function limitResponse(response) {
+  if (!response.body || response.body.locked) throw failure();
+  const reader = response.body.getReader();
+  if (!response.ok) {
+    try {
+      await reader.cancel();
+    } finally {
+      reader.releaseLock();
+    }
+    throw failure();
+  }
+  let size = 0,
+    lineHasBytes = false,
+    pendingCR = false,
+    released = false;
+  const release = () => {
+    if (!released) {
+      released = true;
+      reader.releaseLock();
+    }
+  };
+  const cancel = async (reason) => {
+    try {
+      await reader.cancel(reason);
+    } finally {
+      release();
+    }
+  };
+  const newline = () => {
+    if (!lineHasBytes) size = 0;
+    lineHasBytes = false;
+  };
+  const body = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { value, done } = await reader.read();
+        if (done) {
+          release();
+          controller.close();
+          return;
+        }
+        if (!(value instanceof Uint8Array)) throw failure();
+        for (const byte of value) {
+          if (pendingCR && byte !== 10) {
+            newline();
+            pendingCR = false;
+          }
+          size++;
+          if (size > MAX_EVENT_BYTES) throw failure();
+          if (pendingCR) {
+            newline();
+            pendingCR = false;
+          } else if (byte === 13) pendingCR = true;
+          else if (byte === 10) newline();
+          else lineHasBytes = true;
+        }
+        controller.enqueue(value);
+      } catch {
+        try {
+          await cancel();
+        } catch {
+          /* Failure remains closed. */
+        }
+        controller.error(failure());
+      }
+    },
+    async cancel(reason) {
+      await cancel(reason);
+    },
+  });
+  const bounded = new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+  return new Proxy(bounded, {
+    get(target, property) {
+      if (
+        property === "url" ||
+        property === "redirected" ||
+        property === "type"
+      )
+        return response[property];
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }

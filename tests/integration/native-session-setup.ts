@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
+import { currentNativePolicyRevision } from "../../packages/splyce-pi/dist/policy.js";
 import { ConfigAuthority } from "../../packages/splyce-pi/dist/config.js";
 import {
   type GrantRecord,
@@ -180,7 +181,18 @@ function fixture(t: TestContext, multiOrigin = false) {
     assert.ok(basename(target).startsWith("native-session-store-"));
     rmSync(target, { recursive: true, force: true });
   });
-  return { dir, path, store, caller, workspaceId, a, b, next, open };
+  return {
+    dir,
+    path,
+    store,
+    caller,
+    workspaceId,
+    a,
+    b,
+    next,
+    open,
+    references,
+  };
 }
 type Fixture = ReturnType<typeof fixture>;
 
@@ -239,6 +251,7 @@ const start = (f: Fixture, name: ProfileName = "a") =>
     f.store.prepareNativeSessionSetup("session.start", startRequest(f, name)),
     binding(f.next("pi-storage")),
     f.caller,
+    currentNativePolicyRevision,
   );
 const use = (f: Fixture, grant: GrantRecord) => ({
   grantId: grant.grantId,
@@ -259,6 +272,7 @@ const commit = (
         preparation,
         binding(f.next("pi-storage")),
         f.caller,
+        currentNativePolicyRevision,
       );
 const trigger = (f: Fixture, sql: string) => {
   const raw = new DatabaseSync(f.path);
@@ -345,7 +359,12 @@ test("start commits the supplied anchor and exact session grant before reporting
     startRequest(f),
   );
   const pi = binding("pi-storage-original");
-  const started = f.store.commitNativeSessionStart(prepared, pi, f.caller);
+  const started = f.store.commitNativeSessionStart(
+    prepared,
+    pi,
+    f.caller,
+    currentNativePolicyRevision,
+  );
   assert.deepEqual(started.result.readiness, { state: "unavailable" });
   assert.equal(started.result.sessionId, pi.piSessionId);
   const anchor = rows(f).find(
@@ -399,6 +418,7 @@ test("start deduplicates shared origins and mints one grant for each distinct or
     prepared,
     binding("pi-storage-multi"),
     f.caller,
+    currentNativePolicyRevision,
   );
   const grants = mintedGrants(f);
   assert.equal(grants.length, 2);
@@ -427,6 +447,7 @@ test("identical select/start replay returns the original result after a later se
     f.store.prepareNativeSessionSetup("session.start", request),
     binding("pi-storage-first"),
     f.caller,
+    currentNativePolicyRevision,
   );
   const later = select(f, "b");
   const before = state(f);
@@ -438,6 +459,7 @@ test("identical select/start replay returns the original result after a later se
     f.store.prepareNativeSessionSetup("session.start", request),
     binding("pi-storage-unused-retry"),
     f.caller,
+    currentNativePolicyRevision,
   );
   assert.deepEqual(selectionReplay.result, firstSelection.result);
   assert.deepEqual(startReplay.result, firstStart.result);
@@ -463,6 +485,7 @@ test("reusing a request with changed expected fields conflicts without writes", 
     f.store.prepareNativeSessionSetup("session.start", request),
     binding("pi-storage-conflict"),
     f.caller,
+    currentNativePolicyRevision,
   );
   for (const [command, changed] of [
     ["profile.select", { ...selection, expectedProfileRevision: "p-other" }],
@@ -855,11 +878,21 @@ test("bind compensation is atomic and idempotent when another handle already rev
     "CREATE TRIGGER fail_native_compensation BEFORE INSERT ON records WHEN NEW.kind = 'grant' BEGIN SELECT RAISE(ABORT, 'fixture compensation failure'); END;",
   );
   const before = state(f);
-  assert.throws(() => f.store.failNativeSessionStart(request, f.caller));
+  assert.throws(() =>
+    f.store.failNativeSessionStart(
+      request,
+      f.caller,
+      currentNativePolicyRevision,
+    ),
+  );
   assert.deepEqual(state(f), before);
   trigger(f, "DROP TRIGGER fail_native_compensation;");
   f.open().revokeGrant(started.grantIds[0]!, f.caller);
-  const failed = f.store.failNativeSessionStart(request, f.caller);
+  const failed = f.store.failNativeSessionStart(
+    request,
+    f.caller,
+    currentNativePolicyRevision,
+  );
   assert.equal(failed.result.sessionId, started.result.sessionId);
   assert.equal(failed.result.sessionRevision, started.result.sessionRevision);
   assert.deepEqual(failed.result.readiness, {
@@ -878,7 +911,11 @@ test("bind compensation is atomic and idempotent when another handle already rev
   }
   const compensated = state(f);
   assert.deepEqual(
-    f.store.failNativeSessionStart(request, f.caller).result,
+    f.store.failNativeSessionStart(
+      request,
+      f.caller,
+      currentNativePolicyRevision,
+    ).result,
     failed.result,
   );
   assert.deepEqual(state(f), compensated);
@@ -927,6 +964,7 @@ test("bind compensation revokes authority after the profile or model descriptor 
       prepared,
       binding(f.next("pi-storage-deleted-metadata")),
       f.caller,
+      currentNativePolicyRevision,
     );
     const grant = mintedGrants(f).find(
       ({ grantId }) => grantId === started.grantIds[0],
@@ -947,6 +985,7 @@ test("bind compensation revokes authority after the profile or model descriptor 
         sessionRevision: started.result.sessionRevision,
       },
       f.caller,
+      currentNativePolicyRevision,
     );
     assert.equal(failed.result.sessionId, started.result.sessionId);
     assert.equal(failed.result.sessionRevision, started.result.sessionRevision);
@@ -1104,4 +1143,141 @@ test("current start assertion rejects rival config, grants, descriptors and fore
     );
     assert.deepEqual(state(f), before, mutation);
   }
+});
+
+test("session policy witness is read under the write lock and refreshed on legacy replay without minting", (t) => {
+  const f = fixture(t);
+  select(f);
+  const request = startRequest(f);
+  const prepared = f.store.prepareNativeSessionSetup("session.start", request);
+  const observer = f.references;
+  let calls = 0;
+  const lockedPolicy = (workspaceId: string) => {
+    calls++;
+    assert.equal(workspaceId, f.workspaceId);
+    assert.throws(() => observer.exec("BEGIN IMMEDIATE;"), /locked/);
+    assert.equal(observer.isTransaction, false);
+    return "7";
+  };
+  const committed = f.store.commitNativeSessionStart(
+    prepared,
+    binding("pi-policy"),
+    { ...f.caller, policyRevision: "untrusted-policy" },
+    lockedPolicy,
+  );
+  assert.equal(calls, 1);
+  assert.equal(committed.result.policyRevision, "7");
+  const before = state(f);
+  const replay = f.store.commitNativeSessionStart(
+    f.store.prepareNativeSessionSetup("session.start", request),
+    undefined,
+    f.caller,
+    (workspaceId) => {
+      assert.equal(workspaceId, f.workspaceId);
+      assert.throws(() => observer.exec("BEGIN IMMEDIATE;"), /locked/);
+      return "8";
+    },
+  );
+  assert.equal(replay.result.policyRevision, "8");
+  assert.equal(replay.result.sessionId, committed.result.sessionId);
+  assert.equal(replay.result.sessionRevision, committed.result.sessionRevision);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.grantIds, committed.grantIds);
+  assert.deepEqual(state(f), before);
+  // The unchanged v1 receipt contains identity only; replay gets the current native witness.
+  const receipt = rows(f).find(
+    ({ kind, record }) =>
+      kind === "artifact" &&
+      (record as unknown as { nativeSetup?: { sessionId?: string } })
+        .nativeSetup?.sessionId === "pi-policy",
+  );
+  assert.ok(receipt);
+  assert.equal(JSON.stringify(receipt).includes('"policyRevision"'), false);
+});
+
+test("missing, throwing and noncanonical session policy getters roll back fresh starts and replays", (t) => {
+  const f = fixture(t);
+  select(f);
+  const request = startRequest(f);
+  const invalidGetters = [
+    undefined,
+    () => {
+      throw new Error("unavailable");
+    },
+    ...[
+      "",
+      "00",
+      "01",
+      "-1",
+      "1.0",
+      " 1",
+      "1\n",
+      "9".repeat(129),
+      1,
+      null,
+      Promise.resolve("1"),
+    ].map((value) => () => value),
+  ];
+  for (const getter of invalidGetters) {
+    const before = state(f);
+    assert.throws(
+      () =>
+        f.store.commitNativeSessionStart(
+          f.store.prepareNativeSessionSetup("session.start", request),
+          binding("pi-policy-invalid"),
+          f.caller,
+          getter as (workspaceId: string) => string,
+        ),
+      code("SETUP_INVALID"),
+    );
+    assert.deepEqual(state(f), before);
+  }
+  const committed = f.store.commitNativeSessionStart(
+    f.store.prepareNativeSessionSetup("session.start", request),
+    binding("pi-policy-valid"),
+    f.caller,
+    currentNativePolicyRevision,
+  );
+  for (const getter of invalidGetters) {
+    const before = state(f);
+    assert.throws(
+      () =>
+        f.store.commitNativeSessionStart(
+          f.store.prepareNativeSessionSetup("session.start", request),
+          undefined,
+          f.caller,
+          getter as (workspaceId: string) => string,
+        ),
+      code("SETUP_INVALID"),
+    );
+    assert.deepEqual(state(f), before);
+  }
+  const before = state(f);
+  assert.throws(
+    () =>
+      f.store.failNativeSessionStart(
+        {
+          workspaceId: f.workspaceId,
+          sessionId: committed.result.sessionId,
+          sessionRevision: committed.result.sessionRevision,
+        },
+        f.caller,
+        () => {
+          throw new Error("unavailable");
+        },
+      ),
+    code("SETUP_INVALID"),
+  );
+  assert.deepEqual(state(f), before);
+  const failed = f.store.failNativeSessionStart(
+    {
+      workspaceId: f.workspaceId,
+      sessionId: committed.result.sessionId,
+      sessionRevision: committed.result.sessionRevision,
+    },
+    f.caller,
+    () => "9",
+  );
+  assert.equal(failed.result.policyRevision, "9");
+  assert.equal(failed.result.readiness.code, "SESSION_BIND_FAILED");
 });

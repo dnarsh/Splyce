@@ -598,6 +598,8 @@ mod windows {
     #[derive(Deserialize)]
     #[serde(tag = "method", deny_unknown_fields)]
     enum NativeOperation {
+        #[serde(rename = "inventory.capture")]
+        Inventory { id: String, params: InventoryParams },
         #[serde(rename = "credential.status")]
         Status { id: String, params: StatusParams },
         #[serde(rename = "credential.redact")]
@@ -608,6 +610,14 @@ mod windows {
         Read { id: String, params: CredentialScope },
         #[serde(rename = "credential.scope.close")]
         Close { id: String, params: CloseScope },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct InventoryParams {
+        canonical_path: String,
+        volume_serial: String,
+        file_id: String,
     }
 
     #[derive(Deserialize)]
@@ -673,6 +683,34 @@ mod windows {
             scopes.retain(|_, (_, deadline, consumed)| *consumed || Instant::now() < *deadline);
         }
         let (id, result) = match operation {
+            NativeOperation::Inventory { id, params } => {
+                if !opaque_id(&id) {
+                    return Err(invalid());
+                }
+                let identity = params
+                    .volume_serial
+                    .parse::<u32>()
+                    .ok()
+                    .zip(params.file_id.parse::<u64>().ok());
+                let result = identity.and_then(|(volume_serial, file_id)| {
+                    crate::inventory::capture(
+                        Path::new(&params.canonical_path),
+                        crate::workspace::DirectoryIdentity {
+                            volume_serial,
+                            file_id,
+                        },
+                    )
+                    .ok()
+                });
+                let unavailable = || serde_json::json!({"native":{"id":id,"ok":false,"error":{"code":"INVENTORY_UNAVAILABLE"}}});
+                let value = match result {
+                    Some(manifest) => {
+                        serde_json::json!({"native":{"id":id,"ok":true,"value":{"manifest":manifest}}})
+                    }
+                    None => unavailable(),
+                };
+                return encode_frame(&value).or_else(|_| encode_frame(&unavailable()));
+            }
             NativeOperation::Status { id, params } => {
                 if !opaque_id(&id) {
                     return Err(invalid());
@@ -1378,6 +1416,99 @@ mod windows {
         }
         fn reply(frame: Vec<u8>) -> Value {
             read_frame(&mut frame.as_slice()).unwrap().0
+        }
+
+        #[test]
+        fn native_inventory_joined_node_transport() {
+            use std::process::{Command, Stdio};
+            let workspace = std::env::temp_dir().join(format!(
+                "splyce-joined-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let data = workspace.with_extension("data");
+            fs::create_dir(&workspace).unwrap();
+            fs::create_dir(&data).unwrap();
+            fs::write(workspace.join("ordinary.txt"), b"ordinary").unwrap();
+            fs::write(workspace.join(".env"), b"secret fixture").unwrap();
+            let qualified = crate::workspace::qualify_directory(&workspace).unwrap();
+            let identity = qualified.identity();
+            drop(qualified);
+            let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(3)
+                .unwrap();
+            let node = repo.join("apps/desktop/src-tauri/resources/engine/node.exe");
+            let fixture = repo.join("tests/fixtures/native-inventory-peer.mjs");
+            let mut child = Command::new(node)
+                .arg(fixture)
+                .arg(&workspace)
+                .arg(&data)
+                .arg(identity.volume_serial.to_string())
+                .arg(identity.file_id.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let (send, receive) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for _ in 0..2 {
+                    if send.send(read_frame(&mut stdout).map(|x| x.0)).is_err() {
+                        break;
+                    }
+                }
+            });
+            let result = (|| -> Result<(), String> {
+                let frame = receive
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+                if frame["native"]["method"] != "inventory.capture" {
+                    return Err("unexpected request".into());
+                }
+                let reply = native_reply(frame, &mut std::collections::HashMap::new())
+                    .map_err(|e| e.to_string())?;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(&reply)
+                    .map_err(|e| e.to_string())?;
+                let result = receive
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+                if result != json!({"ok":true}) {
+                    return Err("fixture assertion failed".into());
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                        return if status.success() {
+                            Ok(())
+                        } else {
+                            Err("node failed".into())
+                        };
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("node timeout".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })();
+            if result.is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            reader.join().unwrap();
+            fs::remove_dir_all(&workspace).unwrap();
+            fs::remove_dir_all(&data).unwrap();
+            result.unwrap();
         }
 
         #[test]

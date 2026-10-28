@@ -21,11 +21,15 @@
   const ERROR_COPY: Readonly<Record<string, string>> = {
     STALE_REVISION:
       "The provider changed since this form was opened. Nothing was saved; reload and try again.",
+    SETUP_REQUEST_CONFLICT:
+      "This setup request conflicts with an earlier request. Check the provider configuration before continuing.",
+    WORKSPACE_SUPERSEDED:
+      "The project changed. Select it again before configuring a provider.",
     POLICY_DENIED:
       "The engine refused this provider setup. Nothing was saved and the key was discarded.",
   };
   const FAILED =
-    "Could not save the provider. Nothing was stored and the key was discarded.";
+    "Could not confirm the provider save. Check the provider configuration before trying again. The key was discarded from this form.";
 
   let endpoint = $state("");
   let apiFamily = $state<ApiFamily>("openai-completions");
@@ -82,7 +86,10 @@
       result = "Provider saved. The key went to the engine and the renderer kept nothing.";
     } catch (error) {
       const code = (error as { code?: unknown } | null)?.code;
-      result = (typeof code === "string" && ERROR_COPY[code]) || FAILED;
+      result =
+        typeof code === "string" && Object.hasOwn(ERROR_COPY, code)
+          ? ERROR_COPY[code]!
+          : FAILED;
     } finally {
       apiKey = "";
       pending = false;

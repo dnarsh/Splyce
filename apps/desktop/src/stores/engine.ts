@@ -90,8 +90,7 @@ function projectPorts(ports: PortAvailability): boolean {
   return (
     lastHandshake?.readiness.state === "ready" &&
     ports.generation &&
-    ports.provider &&
-    ports.workspace
+    ports.provider
   );
 }
 const stateListeners = new Set<(state: EngineConnectionState) => void>();
@@ -311,6 +310,20 @@ export async function invoke<O extends CommandOp>(
     op,
     payload: fullSplyceCommand,
   });
+}
+
+export async function cancelSession(sessionId: string): Promise<void> {
+  const invokeTauri = await getTauriInvoke();
+  if (!invokeTauri) throw new Error("Native backend unavailable");
+  const result = await invokeTauri("cancel", { sessionId, reason: null });
+  if (
+    result === null ||
+    typeof result !== "object" ||
+    Array.isArray(result) ||
+    Object.keys(result).length !== 1 ||
+    (result as { canceled?: unknown }).canceled !== true
+  )
+    throw new Error("Cancellation unavailable");
 }
 
 /**

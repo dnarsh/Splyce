@@ -239,3 +239,6 @@ scripts pass 110/110 at the frozen source, with zero failures, skips or
 cancellations. The full vendor check also passes at the final source bytes, with
 no Biome fixes. This patch activates
 no provider or grant.
+
+The [native option admission record](0014-native-runtime-options.md) covers
+the original-options boundary and its registered-runtime regression.

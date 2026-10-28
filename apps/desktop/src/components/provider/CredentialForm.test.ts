@@ -96,7 +96,7 @@ describe("provider setup form", () => {
   it.each([
     ["STALE_REVISION", "changed since this form was opened"],
     ["POLICY_DENIED", "engine refused this provider setup"],
-    [undefined, "Could not save the provider"],
+    [undefined, "Could not confirm the provider save"],
   ])(
     "rejection %s shows fixed copy, clears the key and never echoes it",
     async (code, copy) => {

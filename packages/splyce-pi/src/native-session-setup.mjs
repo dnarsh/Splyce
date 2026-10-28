@@ -66,7 +66,12 @@ export function validateNativeSessionSetup(command, payload, requestId) {
 }
 
 /** Private native-parent service; only its result projections reach the renderer. */
-export function createNativeSessionSetup({ store, control, factory }) {
+export function createNativeSessionSetup({
+  store,
+  control,
+  factory,
+  currentPolicyRevision,
+}) {
   if (!(store instanceof Store)) unavailable();
   const caller = Object.freeze({
     sessionId: "native-session-setup",
@@ -148,11 +153,13 @@ export function createNativeSessionSetup({ store, control, factory }) {
         preparation,
         undefined,
         caller,
+        currentPolicyRevision,
       );
       if (committed.result.readiness.code === "SESSION_BIND_FAILED") {
         return {
           sessionId: committed.result.sessionId,
           sessionRevision: committed.result.sessionRevision,
+          policyRevision: committed.result.policyRevision,
           readiness: { state: "unavailable", code: "SESSION_BIND_FAILED" },
         };
       }
@@ -170,6 +177,7 @@ export function createNativeSessionSetup({ store, control, factory }) {
           return {
             sessionId: committed.result.sessionId,
             sessionRevision: committed.result.sessionRevision,
+            policyRevision: committed.result.policyRevision,
             readiness: { state: "ready" },
           };
       }
@@ -197,17 +205,19 @@ export function createNativeSessionSetup({ store, control, factory }) {
             branchAnchor: prepared.branchAnchor,
           },
           caller,
+          currentPolicyRevision,
         );
     } catch (error) {
       if (committed) {
         try {
-          store.failNativeSessionStart(
+          committed = store.failNativeSessionStart(
             {
               workspaceId: input.workspaceId,
               sessionId: committed.result.sessionId,
               sessionRevision: committed.result.sessionRevision,
             },
             caller,
+            currentPolicyRevision,
           );
         } catch {
           unavailable("SETUP_OUTCOME_UNKNOWN");
@@ -220,6 +230,7 @@ export function createNativeSessionSetup({ store, control, factory }) {
         return {
           sessionId: committed.result.sessionId,
           sessionRevision: committed.result.sessionRevision,
+          policyRevision: committed.result.policyRevision,
           readiness: { state: "unavailable", code: "SESSION_BIND_FAILED" },
         };
       }
@@ -245,17 +256,19 @@ export function createNativeSessionSetup({ store, control, factory }) {
       return {
         sessionId: committed.result.sessionId,
         sessionRevision: committed.result.sessionRevision,
+        policyRevision: committed.result.policyRevision,
         readiness: { state: "ready" },
       };
     } catch {
       try {
-        store.failNativeSessionStart(
+        committed = store.failNativeSessionStart(
           {
             workspaceId: input.workspaceId,
             sessionId: committed.result.sessionId,
             sessionRevision: committed.result.sessionRevision,
           },
           caller,
+          currentPolicyRevision,
         );
       } catch {
         unavailable("SETUP_OUTCOME_UNKNOWN");
@@ -266,6 +279,7 @@ export function createNativeSessionSetup({ store, control, factory }) {
       return {
         sessionId: committed.result.sessionId,
         sessionRevision: committed.result.sessionRevision,
+        policyRevision: committed.result.policyRevision,
         readiness: { state: "unavailable", code: "SESSION_BIND_FAILED" },
       };
     }
