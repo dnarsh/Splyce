@@ -38,5 +38,7 @@
   },
   { "op": "lease.release", "payload": { "leaseRef": "lease1" } },
   { "op": "engine.restart", "payload": {} },
-  { "op": "session.subscribe", "payload": { "afterSeq": 12 } }
+  { "op": "session.subscribe", "payload": { "afterSeq": 12 } },
+  { "op": "subagent.diff", "payload": { "childId": "child1" } },
+  { "op": "subagent.discard", "payload": { "childId": "child1" } }
 ]

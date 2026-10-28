@@ -685,6 +685,10 @@ export interface CommandPayloads {
   "lease.release": { leaseRef: string };
   "engine.restart": Record<string, never>;
   "session.subscribe": { afterSeq: number };
+  /** TD-70 review surface: the pending worktree patch and its apply act. */
+  "subagent.diff": { childId: string };
+  /** TD-70 review surface: drop a pending worktree without applying it. */
+  "subagent.discard": { childId: string };
 }
 export type CommandOp = keyof CommandPayloads;
 export type SplyceCommand = {
@@ -718,6 +722,8 @@ const COMMAND_SCHEMAS = {
   "lease.release": { leaseRef: "ref" },
   "engine.restart": {},
   "session.subscribe": { afterSeq: "uint" },
+  "subagent.diff": { childId: "id" },
+  "subagent.discard": { childId: "id" },
 } as const satisfies { [K in CommandOp]: Shape };
 const COMMAND_OPTIONAL: Partial<Record<CommandOp, Shape>> = {
   "session.start": { piSessionId: "ref", initialPrompt: "text" },
