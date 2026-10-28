@@ -144,6 +144,10 @@ function harness(
   options: {
     limits?: Record<string, number>;
     parentGrants?: Partial<Record<keyof typeof GRANTS, string>>;
+    seed?: (ctx: {
+      store: Store;
+      caller: Parameters<Store["append"]>[1];
+    }) => void;
   } = {},
 ) {
   const dir = realpathSync.native(
@@ -268,6 +272,7 @@ function harness(
       cacheDir: join(dir, "cache"),
     });
   })();
+  options.seed?.({ store, caller });
   const supervisor = new SubagentSupervisor({
     store,
     caller,
@@ -376,6 +381,33 @@ test("read child cites code index and read results through admitted Pi tools; ev
     "child.progress",
     "child.completed",
   ]);
+  // Published child DTO: parentRunId/status/budget on every event, citations as objects.
+  const started = h.events().find((e) => e.kind === "child.started")!;
+  const base = started.payload as {
+    parentRunId: string;
+    status: string;
+    budget: Record<string, number>;
+  };
+  assert.equal(base.parentRunId, "r1");
+  assert.equal(base.status, "running");
+  assert.deepEqual(base.budget, {
+    concurrency: 2,
+    maxTurns: 8,
+    maxTokens: 200_000,
+    wallClockMs: 300_000,
+  });
+  const completed = h.events().find((e) => e.kind === "child.completed")!;
+  const donePayload = completed.payload as {
+    parentRunId: string;
+    status: string;
+    citations: { path: string; line?: number }[];
+  };
+  assert.equal(donePayload.parentRunId, "r1");
+  assert.equal(donePayload.status, "completed");
+  assert.ok(
+    donePayload.citations.some((c) => c.path === "src/main.ts" && c.line === 2),
+    JSON.stringify(donePayload.citations),
+  );
   // Every child tool call is a receipted parent-run action under the child's grant.
   const done = h.actions().filter((a) => a.state === "completed");
   assert.deepEqual(done.map((a) => a.capabilityId).sort(), [
@@ -600,6 +632,15 @@ test("dependencies order tasks, pass results forward and fail dependents; team r
   );
   const second = h.prompts.find((p) => p.startsWith("ROLE judge:"))!;
   assert.match(second, /Result of a:\nsummary of ROLE scout:/u);
+  const started = h
+    .events()
+    .filter((e) => e.kind === "child.started")
+    .map((e) => e.payload as { team?: string; role?: string });
+  assert.ok(
+    started.some((p) => p.team === "review" && p.role === "scout"),
+    JSON.stringify(started),
+  );
+  assert.ok(started.some((p) => p.team === "review" && p.role === undefined));
   await assert.rejects(
     h.spawn({
       tasks: [
@@ -647,10 +688,16 @@ test("write child edits only its worktree; apply needs a once-grant and lands th
     /return 42/u,
   );
   const completed = h.events().find((e) => e.kind === "child.completed")!;
-  assert.deepEqual((completed.payload as { files: string[] }).files.sort(), [
+  const diff = (completed.payload as { diff: { files: typeof r.files } }).diff;
+  assert.deepEqual(diff.files.map((f) => `${f.status} ${f.path}`).sort(), [
     "added src/new.ts",
     "modified src/helper.ts",
   ]);
+  assert.equal(
+    (completed.payload as { files?: unknown }).files,
+    undefined,
+    "patch file list lives under diff, not files",
+  );
   // Writes were receipted under the parent's write grant without an approval.
   assert.ok(
     h
@@ -770,63 +817,140 @@ test("two write children claiming one path: the second gets FILE_CLAIM_CONFLICT;
   h.supervisor.claim("later-child", "src/shared.ts");
 });
 
-test("parent cancel kills a write child's running shell process tree", async (t) => {
-  const pidFile = join(tmpdir(), `splyce-e1-pid-${process.pid}-${Date.now()}`);
-  const script = `require('fs').writeFileSync(${JSON.stringify(pidFile.replaceAll("\\", "/"))}, String(process.pid)); setInterval(() => {}, 1000);`;
-  const h = harness(t, ({ turn }) =>
-    turn === 0
-      ? call("bash", { command: `node -e "${script.replaceAll('"', '\\"')}"` })
-      : say("never"),
-  );
-  t.after(() => rmSync(pidFile, { force: true }));
-  const pending = h.spawn({ tasks: [{ prompt: "run it", mode: "write" }] });
-  const deadline = Date.now() + 20_000;
-  while (!existsSync(pidFile) || !readFileSync(pidFile, "utf8")) {
-    assert.ok(Date.now() < deadline, "shell child never started");
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  const pid = Number(readFileSync(pidFile, "utf8"));
-  assert.doesNotThrow(
-    () => process.kill(pid, 0),
-    "shell child is alive before cancel",
-  );
+test("parent cancel stops a running write child and discards its worktree", async (t) => {
+  let entered!: () => void;
+  const running = new Promise<void>((r) => (entered = r));
+  const h = harness(t, async ({ signal }) => {
+    entered();
+    await until(signal);
+    throw new Error("aborted");
+  });
+  const pending = h.spawn({ tasks: [{ prompt: "hold", mode: "write" }] });
+  await running;
+  while (h.live() === 0) await new Promise((r) => setTimeout(r, 10));
   h.parentAbort.abort();
   const { results } = await pending;
   assert.equal(results[0]!.status, "cancelled");
-  const alive = () => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  const killDeadline = Date.now() + 10_000;
-  while (alive() && Date.now() < killDeadline)
-    await new Promise((r) => setTimeout(r, 50));
-  assert.equal(alive(), false, "cancel must kill the child's shell process");
   assert.equal(h.live(), 0, "cancelled worktree is discarded");
 });
 
-test("write child shell runs in the worktree with a scrubbed environment", async (t) => {
-  process.env.SPLYCE_E1_CANARY = SECRET;
-  t.after(() => delete process.env.SPLYCE_E1_CANARY);
-  let output = "";
-  const probe =
-    "console.log((process.env.SPLYCE_E1_CANARY || 'absent') + '|' + process.cwd())";
-  const h = harness(t, ({ turn, messages }) => {
-    if (turn === 0) return call("bash", { command: `node -e "${probe}"` });
-    output = text(messages.findLast((m) => m.role === "toolResult")?.content);
-    return say("checked");
-  });
+test("write child has no shell tool; an absolute shell write cannot reach the parent", async (t) => {
+  let target = "";
+  const h = harness(t, ({ turn }) =>
+    turn === 0
+      ? call("bash", {
+          command: `node -e "require('fs').writeFileSync('${target}','escaped-by-shell')"`,
+        })
+      : say("never"),
+  );
+  target = join(h.workspace, "src", "escaped.ts").replaceAll("\\", "/");
   const { results } = await h.spawn({
-    tasks: [{ prompt: "probe env", mode: "write" }],
+    tasks: [{ prompt: "escape the worktree", mode: "write" }],
+  });
+  assert.equal(results[0]!.status, "failed");
+  if (results[0]!.status === "failed")
+    assert.equal(results[0]!.reason, "CAPABILITY_DENIED");
+  assert.equal(
+    existsSync(target),
+    false,
+    "a shell write must not reach the parent workspace",
+  );
+  // Asking for shell.run up front is a typed denial before any child starts.
+  await assert.rejects(
+    h.spawn({
+      tasks: [{ prompt: "x", mode: "write", capabilities: ["shell.run"] }],
+    }),
+    (e: unknown) =>
+      e instanceof SubagentError && e.code === "CAPABILITY_DENIED",
+  );
+});
+
+test("a claim left by a dead child is swept and does not block a new writer", async (t) => {
+  const h = harness(
+    t,
+    ({ turn }) =>
+      turn === 0
+        ? call("edit", {
+            path: "src/helper.ts",
+            edits: [{ oldText: "return 42;", newText: "return 44;" }],
+          })
+        : say("edited helper"),
+    {
+      seed: ({ store, caller }) =>
+        store.append(
+          {
+            kind: "fileClaim",
+            record: {
+              ...records.fileClaim,
+              recordId: "rec-claim-dead",
+              sourceIds: ["rec-run"],
+              workspaceId: "w-demo",
+              path: "src/helper.ts",
+              ownerChildId: "dead-child-from-a-crash",
+              releasedAt: null,
+            },
+          },
+          caller,
+        ),
+    },
+  );
+  const swept = h.store
+    .list("w-demo")
+    .records.filter(({ kind }) => kind === "fileClaim")
+    .map(
+      ({ record }) =>
+        record as { ownerChildId: string; releasedAt: string | null },
+    )
+    .filter((c) => c.ownerChildId === "dead-child-from-a-crash");
+  assert.ok(
+    swept.length >= 2,
+    "the sweep appends a release for the dead owner",
+  );
+  assert.notEqual(swept.at(-1)!.releasedAt, null);
+  const { results } = await h.spawn({
+    tasks: [{ prompt: "edit", mode: "write" }],
   });
   assert.equal(results[0]!.status, "completed", JSON.stringify(results[0]));
-  assert.match(output, /^absent\|/u, output);
-  assert.ok(!output.includes(SECRET));
-  assert.ok(
-    output.toLowerCase().includes(join(h.dir, "worktrees").toLowerCase()),
-    `shell cwd must be the child worktree: ${output}`,
+  assert.match(
+    readFileSync(join(h.workspace, "src", "helper.ts"), "utf8"),
+    /return 42;/u,
+    "parent untouched before apply",
   );
+});
+
+test("subagent.diff caps the patch at 256 KiB, redacts secrets and names the apply act", async (t) => {
+  const big = `// ${SECRET}\n${"x".repeat(300 * 1024)}`;
+  const h = harness(t, ({ turn }) =>
+    turn === 0
+      ? call("write", { path: "src/big.ts", content: big })
+      : say("wrote big"),
+  );
+  const { results } = await h.spawn({
+    tasks: [{ prompt: "write a big file", mode: "write" }],
+  });
+  assert.equal(results[0]!.status, "completed", JSON.stringify(results[0]));
+  const tool = subagentTools(h.supervisor).find(
+    (candidate) => candidate.name === "subagent_diff",
+  )!;
+  const diff = (await tool.execute({ childId: results[0]!.childId })) as {
+    worktreeId: string;
+    files: { path: string; status: string }[];
+    patch: string;
+    truncated: boolean;
+    bytes: number;
+    actionId: string;
+    argumentsDigest: string;
+  };
+  assert.equal(diff.truncated, true);
+  assert.ok(
+    Buffer.byteLength(diff.patch) <= 262_144,
+    `patch is ${Buffer.byteLength(diff.patch)} bytes`,
+  );
+  assert.ok(diff.bytes > 262_144);
+  assert.ok(!diff.patch.includes(SECRET), "patch must be redacted");
+  assert.match(diff.patch, /\[redacted\]/u);
+  assert.deepEqual(diff.files, [{ path: "src/big.ts", status: "added" }]);
+  assert.equal(diff.actionId, `worktree.apply:${diff.worktreeId}`);
+  assert.ok(diff.argumentsDigest);
+  await assert.rejects(tool.execute({ childId: "missing" }), SubagentError);
 });

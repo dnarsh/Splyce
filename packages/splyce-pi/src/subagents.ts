@@ -26,6 +26,8 @@ import { existsSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { RevisionFence } from "./admission.js";
 import {
+  type ChildBudget,
+  type ChildEventBase,
   CONTRACT_VERSION,
   type EventPayloads,
   PROTOCOL_VERSION,
@@ -53,12 +55,18 @@ export const CAPABILITIES = [
   "shell.run",
 ] as const;
 export type Capability = (typeof CAPABILITIES)[number];
-/** Read children never get fs.write or shell.run, whatever the parent holds. */
+/** Read children never get fs.write or shell.run. No child gets shell.run: a
+ *  child runs without an OS sandbox, so an absolute path would escape its root. */
 export const MODE_CAPABILITIES: Readonly<
   Record<SubagentMode, readonly Capability[]>
 > = Object.freeze({
   read: Object.freeze(["fs.read", "code.index", "memory.query"] as const),
-  write: CAPABILITIES,
+  write: Object.freeze([
+    "fs.read",
+    "code.index",
+    "memory.query",
+    "fs.write",
+  ] as const),
 });
 
 export class SubagentError extends Error {
@@ -252,10 +260,21 @@ export interface SpawnResult {
   team?: string;
   results: ChildResult[];
 }
+/** What the parent reviews before apply: the displayed patch is bounded/redacted. */
+export interface SubagentDiff {
+  worktreeId: string;
+  files: WorktreeFile[];
+  patch: string;
+  truncated: boolean;
+  bytes: number;
+  actionId: string;
+  argumentsDigest: string;
+}
 
 const MAX_SUMMARY = 2000;
 const MAX_CITATIONS = 64;
 const MAX_PROMPT = 16_384;
+const MAX_DIFF_BYTES = 262_144;
 const CHILD_ADMISSION_CODES = new Set<string>([
   "CAPABILITY_DENIED",
   "PATH_OUTSIDE_WORKSPACE",
@@ -273,6 +292,13 @@ const posInt = (value: unknown, field: string): number => {
   return value as number;
 };
 const lower = (path: string): string => path.toLowerCase();
+/** The per-call budget every child.* event publishes. */
+const childBudget = (limits: SubagentLimits): ChildBudget => ({
+  concurrency: limits.concurrency,
+  maxTurns: limits.maxTurns,
+  maxTokens: limits.maxTokens,
+  wallClockMs: limits.wallClockMs,
+});
 
 /** Validates model-supplied spawn arguments (a trust boundary). */
 export function parseSpawnInput(
@@ -377,6 +403,12 @@ export interface ChildRun {
   stop?: FailureReason;
   admissionError?: { code: string; message: string };
 }
+/** Team/role/budget shared by every event a child emits. */
+interface ChildContext {
+  team?: string;
+  role?: string;
+  budget: ChildBudget;
+}
 
 export class SubagentSupervisor {
   private readonly host: SubagentHost;
@@ -390,6 +422,7 @@ export class SubagentSupervisor {
     this.limits = { ...DEFAULT_SUBAGENT_LIMITS, ...host.limits };
     for (const key of Object.keys(this.limits) as (keyof SubagentLimits)[])
       posInt(this.limits[key], `limits.${key}`);
+    this.sweepClaims();
   }
 
   /** For WorktreeManager.isChildLive: running, or completed with a pending worktree. */
@@ -412,6 +445,39 @@ export class SubagentSupervisor {
     const { files, actionId, argumentsDigest } =
       await this.host.worktrees.diff(worktreeId);
     return { files, actionId, argumentsDigest };
+  }
+
+  /**
+   * The diff the parent reviews: the patch is redacted for display and capped at
+   * 256 KiB. Apply still binds the engine's actionId/argumentsDigest, not this text.
+   */
+  async diff(childId: string): Promise<SubagentDiff> {
+    const worktreeId = this.applicable.get(childId);
+    if (worktreeId === undefined || !this.host.worktrees)
+      throw new SubagentError(
+        "CHILD_NOT_APPLICABLE",
+        "child has no completed worktree",
+      );
+    const { patch, files, actionId, argumentsDigest } =
+      await this.host.worktrees.diff(worktreeId);
+    const full = this.host.redact(patch);
+    const encoded = new TextEncoder().encode(full);
+    const bytes = encoded.byteLength;
+    const truncated = bytes > MAX_DIFF_BYTES;
+    const shown = truncated
+      ? new TextDecoder()
+          .decode(encoded.subarray(0, MAX_DIFF_BYTES))
+          .replace(/\uFFFD+$/u, "")
+      : full;
+    return {
+      worktreeId,
+      files,
+      patch: shown,
+      truncated,
+      bytes,
+      actionId,
+      argumentsDigest,
+    };
   }
 
   /** Cancels one child; the parent and its siblings keep running. */
@@ -454,14 +520,25 @@ export class SubagentSupervisor {
             if (results.has(task.id) || active >= budget.concurrency) continue;
             if (started.has(task.id)) continue;
             const deps = task.after.map((d) => results.get(d));
+            const ctx: ChildContext = {
+              budget: childBudget(budget),
+              ...(input.team ? { team: input.team.name } : {}),
+              ...(task.role ? { role: task.role } : {}),
+            };
             if (this.host.parent.signal.aborted) {
-              results.set(task.id, this.never(task.id, task.mode, "cancelled"));
+              results.set(
+                task.id,
+                this.never(task.id, task.mode, "cancelled", ctx),
+              );
               progressed = true;
               continue;
             }
             if (deps.some((d) => d === undefined)) continue;
             if (deps.some((d) => d!.status !== "completed")) {
-              results.set(task.id, this.never(task.id, task.mode, "failed"));
+              results.set(
+                task.id,
+                this.never(task.id, task.mode, "failed", ctx),
+              );
               progressed = true;
               continue;
             }
@@ -481,7 +558,7 @@ export class SubagentSupervisor {
               task.id,
               task.mode,
               caps.get(task.id)!,
-              budget,
+              ctx,
               prefix + task.prompt + context,
             ).then((result) => {
               results.set(task.id, result);
@@ -670,17 +747,19 @@ export class SubagentSupervisor {
     taskId: string,
     mode: SubagentMode,
     status: "failed" | "cancelled",
+    ctx: ChildContext,
   ): ChildResult {
     const childId = randomUUID();
-    const runId = this.host.parent.runId;
     if (status === "cancelled") {
-      this.emit("child.cancelled", { runId, childId, cleanedUp: true });
+      this.emit("child.cancelled", {
+        ...this.base(childId, ctx, "cancelled"),
+        cleanedUp: true,
+      });
       return { taskId, childId, mode, status };
     }
     const message = "a dependency did not complete";
     this.emit("child.failed", {
-      runId,
-      childId,
+      ...this.base(childId, ctx, "failed"),
       reason: "DEPENDENCY_FAILED",
       message,
     });
@@ -694,15 +773,30 @@ export class SubagentSupervisor {
     };
   }
 
+  /** Identity, state, budget and optional team/role shared by every child.* event. */
+  private base<S extends ChildEventBase["status"]>(
+    childId: string,
+    ctx: ChildContext,
+    status: S,
+  ): ChildEventBase & { status: S } {
+    return {
+      childId,
+      parentRunId: this.host.parent.runId,
+      status,
+      budget: ctx.budget,
+      ...(ctx.team ? { team: ctx.team } : {}),
+      ...(ctx.role ? { role: ctx.role } : {}),
+    };
+  }
+
   private async child(
     taskId: string,
     mode: SubagentMode,
     capabilities: Capability[],
-    budget: SubagentLimits,
+    ctx: ChildContext,
     prompt: string,
   ): Promise<ChildResult> {
     const { host } = this;
-    const runId = host.parent.runId;
     const run: ChildRun = {
       childId: randomUUID(),
       controller: new AbortController(),
@@ -712,7 +806,10 @@ export class SubagentSupervisor {
     host.parent.signal.addEventListener("abort", onParent, { once: true });
     if (host.parent.signal.aborted) controller.abort();
     this.running.set(childId, run);
-    this.emit("child.started", { runId, childId, mode });
+    this.emit("child.started", {
+      ...this.base(childId, ctx, "running"),
+      mode,
+    });
     const unbind: Array<() => void> = [];
     const claims = new Set<string>();
     let worktreeId: string | undefined;
@@ -766,7 +863,7 @@ export class SubagentSupervisor {
       const citations: Citation[] = [];
       const reads = new Map<string, unknown>();
       agent.subscribe((event) => {
-        if (event.type === "turn_start" && turns >= budget.maxTurns)
+        if (event.type === "turn_start" && turns >= ctx.budget.maxTurns)
           stop("BUDGET_TURNS");
         if (event.type === "turn_end") {
           turns++;
@@ -774,8 +871,12 @@ export class SubagentSupervisor {
             event as { message: { usage?: { totalTokens?: number } } }
           ).message.usage;
           tokens += usage?.totalTokens ?? 0;
-          this.emit("child.progress", { runId, childId, turns, tokens });
-          if (tokens > budget.maxTokens) stop("BUDGET_TOKENS");
+          this.emit("child.progress", {
+            ...this.base(childId, ctx, "running"),
+            turns,
+            tokens,
+          });
+          if (tokens > ctx.budget.maxTokens) stop("BUDGET_TOKENS");
         }
         if (event.type === "tool_execution_start") {
           const e = event as { toolCallId: string; args: unknown };
@@ -799,7 +900,10 @@ export class SubagentSupervisor {
       controller.signal.addEventListener("abort", () => agent.abort(), {
         once: true,
       });
-      timer = setTimeout(() => stop("BUDGET_WALL_CLOCK"), budget.wallClockMs);
+      timer = setTimeout(
+        () => stop("BUDGET_WALL_CLOCK"),
+        ctx.budget.wallClockMs,
+      );
       const settled = agent.prompt(prompt);
       if (controller.signal.aborted) agent.abort();
       await settled;
@@ -811,6 +915,7 @@ export class SubagentSupervisor {
           mode,
           run.stop,
           `${run.stop} after ${turns} turns and ${tokens} tokens`,
+          ctx,
         );
       else if (controller.signal.aborted)
         result = { taskId, childId, mode, status: "cancelled" };
@@ -826,6 +931,7 @@ export class SubagentSupervisor {
                 ? (denied.code as FailureReason)
                 : "POLICY_DENIED",
               denied.message,
+              ctx,
             )
           : this.failed(
               taskId,
@@ -835,6 +941,7 @@ export class SubagentSupervisor {
                 ? "PROVIDER_ERROR"
                 : "ENGINE_ERROR",
               error,
+              ctx,
             );
       } else {
         const files = worktreeId
@@ -843,15 +950,10 @@ export class SubagentSupervisor {
         const summary = this.text(lastText(agent.state.messages));
         const kept_ = citations.slice(0, MAX_CITATIONS);
         this.emit("child.completed", {
-          runId,
-          childId,
+          ...this.base(childId, ctx, "completed"),
           summary,
-          citations: kept_.map((c) =>
-            c.line === undefined ? c.path : `${c.path}:${c.line}`,
-          ),
-          ...(files
-            ? { files: files.map((f) => `${f.status} ${f.path}`) }
-            : {}),
+          citations: kept_,
+          ...(files ? { diff: { files } } : {}),
         });
         if (worktreeId) {
           this.applicable.set(childId, worktreeId);
@@ -883,6 +985,7 @@ export class SubagentSupervisor {
           ? "CAPABILITY_DENIED"
           : "ENGINE_ERROR",
         error.message,
+        ctx,
       );
     } finally {
       clearTimeout(timer);
@@ -893,7 +996,10 @@ export class SubagentSupervisor {
     }
     if (worktreeId && !kept) await host.worktrees!.discard(worktreeId);
     if (result.status === "cancelled")
-      this.emit("child.cancelled", { runId, childId, cleanedUp: true });
+      this.emit("child.cancelled", {
+        ...this.base(childId, ctx, "cancelled"),
+        cleanedUp: true,
+      });
     return result;
   }
 
@@ -903,11 +1009,11 @@ export class SubagentSupervisor {
     mode: SubagentMode,
     reason: FailureReason,
     message: string,
+    ctx: ChildContext,
   ): ChildResult {
     const text = this.text(message);
     this.emit("child.failed", {
-      runId: this.host.parent.runId,
-      childId,
+      ...this.base(childId, ctx, "failed"),
       reason,
       message: text,
     });
@@ -950,6 +1056,24 @@ export class SubagentSupervisor {
     );
   }
 
+  /**
+   * Releases claims whose owning child is gone (crash or restart) and never
+   * released. One supervisor owns a scope, so a claim it does not know is dead.
+   */
+  private sweepClaims(): void {
+    const { store, parent } = this.host;
+    const latest = new Map<string, RecordByKind["fileClaim"]>();
+    for (const { kind, record } of store.list(parent.scopeId).records) {
+      if (kind !== "fileClaim") continue;
+      const claim = record as RecordByKind["fileClaim"];
+      if (claim.workspaceId !== parent.workspaceId) continue;
+      latest.set(`${claim.ownerChildId}\u0000${lower(claim.path)}`, claim);
+    }
+    for (const claim of latest.values())
+      if (claim.releasedAt === null && !this.isChildLive(claim.ownerChildId))
+        this.release(claim.ownerChildId, claim.path);
+  }
+
   // ponytail: scans the scope's records per claim; index claims if a scope
   // grows large. In-process the scan and append are one synchronous step.
   private activeClaims(path: string): Set<string> {
@@ -967,7 +1091,9 @@ export class SubagentSupervisor {
     }
     return new Set(
       [...latest.values()]
-        .filter((c) => c.releasedAt === null)
+        .filter(
+          (c) => c.releasedAt === null && this.isChildLive(c.ownerChildId),
+        )
         .map((c) => c.ownerChildId),
     );
   }
@@ -1262,6 +1388,27 @@ export function subagentTools(
       },
       execute: (args: unknown) =>
         supervisor.run(parseSpawnInput(args, supervisor.limits)),
+    },
+    {
+      name: "subagent_diff",
+      description:
+        "Read a completed write child's diff for review: its file list and a redacted unified patch of at most 256 KiB. Applying is a separate once-granted action.",
+      readOnly: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["childId"],
+        properties: { childId: { type: "string", minLength: 1 } },
+      },
+      async execute(args: unknown) {
+        if (
+          !isObject(args) ||
+          typeof args.childId !== "string" ||
+          !args.childId
+        )
+          throw new SubagentError("INVALID_ARGUMENT", "childId is required");
+        return supervisor.diff(args.childId);
+      },
     },
   ]);
 }

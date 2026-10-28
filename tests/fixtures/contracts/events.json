@@ -88,33 +88,83 @@
   },
   {
     "kind": "child.started",
-    "payload": { "runId": "r1", "childId": "child1", "mode": "read" }
+    "payload": {
+      "childId": "child1",
+      "parentRunId": "r1",
+      "team": "review",
+      "role": "scout",
+      "status": "running",
+      "budget": {
+        "concurrency": 2,
+        "maxTurns": 8,
+        "maxTokens": 200000,
+        "wallClockMs": 300000
+      },
+      "mode": "read"
+    }
   },
   {
     "kind": "child.progress",
-    "payload": { "runId": "r1", "childId": "child1", "turns": 1, "tokens": 42 }
+    "payload": {
+      "childId": "child1",
+      "parentRunId": "r1",
+      "status": "running",
+      "budget": {
+        "concurrency": 2,
+        "maxTurns": 8,
+        "maxTokens": 200000,
+        "wallClockMs": 300000
+      },
+      "turns": 1,
+      "tokens": 42
+    }
   },
   {
     "kind": "child.completed",
     "payload": {
-      "runId": "r1",
       "childId": "child1",
+      "parentRunId": "r1",
+      "status": "completed",
+      "budget": {
+        "concurrency": 2,
+        "maxTurns": 8,
+        "maxTokens": 200000,
+        "wallClockMs": 300000
+      },
       "summary": "Found the entrypoint.",
-      "citations": ["src/main.ts:3"],
-      "files": ["M src/main.ts"]
+      "citations": [{ "path": "src/main.ts", "line": 3 }],
+      "diff": { "files": [{ "path": "src/main.ts", "status": "modified" }] }
     }
   },
   {
     "kind": "child.failed",
     "payload": {
-      "runId": "r1",
       "childId": "child1",
+      "parentRunId": "r1",
+      "status": "failed",
+      "budget": {
+        "concurrency": 2,
+        "maxTurns": 8,
+        "maxTokens": 200000,
+        "wallClockMs": 300000
+      },
       "reason": "BUDGET_TURNS",
       "message": "turn budget exhausted"
     }
   },
   {
     "kind": "child.cancelled",
-    "payload": { "runId": "r1", "childId": "child1", "cleanedUp": true }
+    "payload": {
+      "childId": "child1",
+      "parentRunId": "r1",
+      "status": "cancelled",
+      "budget": {
+        "concurrency": 2,
+        "maxTurns": 8,
+        "maxTokens": 200000,
+        "wallClockMs": 300000
+      },
+      "cleanedUp": true
+    }
   }
 ]

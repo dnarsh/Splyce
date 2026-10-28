@@ -340,6 +340,10 @@ type Rule =
   | "uint"
   | "bool"
   | "limits"
+  | "childBudget"
+  | "citations"
+  | "diffFiles"
+  | "childDiff"
   | "portAvailability"
   | "eventEnvelope"
   | readonly string[];
@@ -528,6 +532,7 @@ export interface CommandPayloads {
   "lease.release": { leaseRef: string };
   "engine.restart": Record<string, never>;
   "session.subscribe": { afterSeq: number };
+  "subagent.diff": { childId: string };
 }
 export type CommandOp = keyof CommandPayloads;
 export type SplyceCommand = {
@@ -561,6 +566,7 @@ const COMMAND_SCHEMAS = {
   "lease.release": { leaseRef: "ref" },
   "engine.restart": {},
   "session.subscribe": { afterSeq: "uint" },
+  "subagent.diff": { childId: "id" },
 } as const satisfies { [K in CommandOp]: Shape };
 const COMMAND_OPTIONAL: Partial<Record<CommandOp, Shape>> = {
   "session.start": { piSessionId: "ref", initialPrompt: "text" },
@@ -586,6 +592,35 @@ export interface SplyceErrorPayload {
   retryable: boolean;
   suggestedAction?:
     "RESTART_ENGINE" | "SWITCH_PROFILE" | "REVERT_HUNK" | "RETRY_SAFE";
+}
+export const CHILD_STATUSES = [
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
+export interface ChildBudget {
+  concurrency: number;
+  maxTurns: number;
+  maxTokens: number;
+  wallClockMs: number;
+}
+export interface ChildCitation {
+  path: string;
+  line?: number;
+}
+export interface ChildDiffFile {
+  path: string;
+  status: string;
+}
+/** Every child.* event carries the same identity, state and budget fields. */
+export interface ChildEventBase {
+  childId: string;
+  parentRunId: string;
+  team?: string;
+  role?: string;
+  status: (typeof CHILD_STATUSES)[number];
+  budget: ChildBudget;
 }
 export interface EventPayloads {
   "turn.started": { runId: string; turnId: string };
@@ -640,32 +675,31 @@ export interface EventPayloads {
     activeActionIds: string[];
     state: "ready" | "busy" | "waiting_approval" | "stopped";
   };
-  // TD-70 delegated children; runId is the parent run.
-  "child.started": {
-    runId: string;
-    childId: string;
+  // TD-70 delegated children; parentRunId is the parent run.
+  "child.started": ChildEventBase & {
+    status: "running";
     mode: (typeof SUBAGENT_MODES)[number];
   };
-  "child.progress": {
-    runId: string;
-    childId: string;
+  "child.progress": ChildEventBase & {
+    status: "running";
     turns: number;
     tokens: number;
   };
-  "child.completed": {
-    runId: string;
-    childId: string;
+  "child.completed": ChildEventBase & {
+    status: "completed";
     summary: string;
-    citations: string[];
-    files?: string[];
+    citations: ChildCitation[];
+    diff?: { files: ChildDiffFile[] };
   };
-  "child.failed": {
-    runId: string;
-    childId: string;
+  "child.failed": ChildEventBase & {
+    status: "failed";
     reason: (typeof SUBAGENT_FAILURE_REASONS)[number];
     message?: string;
   };
-  "child.cancelled": { runId: string; childId: string; cleanedUp: boolean };
+  "child.cancelled": ChildEventBase & {
+    status: "cancelled";
+    cleanedUp: boolean;
+  };
 }
 export const SUBAGENT_MODES = ["read", "write"] as const;
 export const SUBAGENT_FAILURE_REASONS = [
@@ -753,26 +787,45 @@ const EVENT_SCHEMAS = {
     activeActionIds: "refs",
     state: ["ready", "busy", "waiting_approval", "stopped"],
   },
-  "child.started": { runId: "ref", childId: "id", mode: SUBAGENT_MODES },
-  "child.progress": {
-    runId: "ref",
+  "child.started": {
     childId: "id",
+    parentRunId: "ref",
+    status: ["running"],
+    budget: "childBudget",
+    mode: SUBAGENT_MODES,
+  },
+  "child.progress": {
+    childId: "id",
+    parentRunId: "ref",
+    status: ["running"],
+    budget: "childBudget",
     turns: "uint",
     tokens: "uint",
   },
   "child.completed": {
-    runId: "ref",
     childId: "id",
+    parentRunId: "ref",
+    status: ["completed"],
+    budget: "childBudget",
     summary: "text",
-    citations: "strings",
+    citations: "citations",
   },
   "child.failed": {
-    runId: "ref",
     childId: "id",
+    parentRunId: "ref",
+    status: ["failed"],
+    budget: "childBudget",
     reason: SUBAGENT_FAILURE_REASONS,
   },
-  "child.cancelled": { runId: "ref", childId: "id", cleanedUp: "bool" },
+  "child.cancelled": {
+    childId: "id",
+    parentRunId: "ref",
+    status: ["cancelled"],
+    budget: "childBudget",
+    cleanedUp: "bool",
+  },
 } as const satisfies { [K in EventKind]: Shape };
+const CHILD_OPTIONAL: Shape = { team: "text", role: "text" };
 const EVENT_OPTIONAL: Partial<Record<EventKind, Shape>> = {
   "engine.status": { ports: "portAvailability" },
   "turn.tool_outcome": { outcomeRef: "ref", error: "text" },
@@ -780,8 +833,11 @@ const EVENT_OPTIONAL: Partial<Record<EventKind, Shape>> = {
   "turn.stream_delta": { turnId: "ref" },
   "turn.thought_delta": { turnId: "ref" },
   "run.reconnect_snapshot": { turnId: "ref" },
-  "child.completed": { files: "strings" },
-  "child.failed": { message: "text" },
+  "child.started": CHILD_OPTIONAL,
+  "child.progress": CHILD_OPTIONAL,
+  "child.completed": { ...CHILD_OPTIONAL, diff: "childDiff" },
+  "child.failed": { ...CHILD_OPTIONAL, message: "text" },
+  "child.cancelled": CHILD_OPTIONAL,
 };
 export const EVENT_KINDS = Object.freeze(
   Object.keys(EVENT_SCHEMAS) as EventKind[],
@@ -1072,6 +1128,55 @@ function rule(
           field,
         );
       break;
+    case "childBudget": {
+      const budget = object(value, field);
+      for (const key of ["concurrency", "maxTurns", "maxTokens", "wallClockMs"])
+        uint(budget[key], `${field}.${key}`);
+      requireThat(
+        Object.keys(budget).length === 4,
+        "INVALID_SHAPE",
+        "budget fields",
+      );
+      break;
+    }
+    case "citations":
+      requireThat(Array.isArray(value), "INVALID_SHAPE", field);
+      for (const item of value) {
+        const citation = object(item, field);
+        text(citation.path, `${field}.path`);
+        if (citation.line !== undefined) uint(citation.line, `${field}.line`);
+        requireThat(
+          Object.keys(citation).every(
+            (key) => key === "path" || key === "line",
+          ),
+          "INVALID_SHAPE",
+          "citation fields",
+        );
+      }
+      break;
+    case "diffFiles":
+      requireThat(Array.isArray(value), "INVALID_SHAPE", field);
+      for (const item of value) {
+        const file = object(item, field);
+        text(file.path, `${field}.path`);
+        text(file.status, `${field}.status`);
+        requireThat(
+          Object.keys(file).length === 2,
+          "INVALID_SHAPE",
+          "diff file fields",
+        );
+      }
+      break;
+    case "childDiff": {
+      const diff = object(value, field);
+      requireThat(
+        Object.keys(diff).length === 1 && Object.hasOwn(diff, "files"),
+        "INVALID_SHAPE",
+        "diff fields",
+      );
+      rule(diff.files, "diffFiles", `${field}.files`, context);
+      break;
+    }
   }
 }
 function shape(
