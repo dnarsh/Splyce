@@ -1113,3 +1113,96 @@ test("a catalog descriptor is accepted only when it exactly equals the trusted c
   // A user descriptor never needs the catalog.
   assert.doesNotThrow(() => validateSetupMetadata(clone(), { trustedCatalog }));
 });
+
+const SECRET_IDS: [string, (v: ReturnType<typeof input>) => void, string][] = [
+  [
+    "modelId",
+    (v) =>
+      void (v.profile.bindings[0]!.modelId = "sk-proj-abcdefghijklmnopqrstuv"),
+    "sk-proj-abcdefghijklmnopqrstuv",
+  ],
+  [
+    "endpointId",
+    (v) => {
+      // Keep endpointRef consistent so only the id shape can reject it.
+      v.endpoint.endpointId = "sk-abcdefghijklmnop";
+      v.connection.endpointRef = "sk-abcdefghijklmnop@e1";
+    },
+    "sk-abcdefghijklmnop",
+  ],
+  [
+    "canonicalUrl",
+    (v) =>
+      void (v.endpoint.canonicalUrl =
+        "https://api.example.com/sk-abcdefghijklmnopqrst"),
+    "sk-abcdefghijklmnopqrst",
+  ],
+];
+
+test("a secret-shaped modelId, endpointId or canonicalUrl is rejected and never persisted", (t) => {
+  const { store, caller } = fixture(t);
+  for (const [name, mutate, secret] of SECRET_IDS) {
+    const bad = clone();
+    mutate(bad);
+    const before = store.cursor(W);
+    let error: unknown;
+    try {
+      store.commitSetup(bad, caller);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(store.cursor(W), before, `${name} must append no records`);
+    assert.deepEqual(kinds(store), [], name);
+    assert.ok(code("SETUP_INVALID")(error), name);
+    assert.ok(
+      !JSON.stringify(store.list(W).records).includes(secret),
+      `${name} must not reach the store`,
+    );
+    assert.throws(() => validateSetupMetadata(bad), invalid, name);
+  }
+});
+
+for (const id of ["gpt-4o-mini", "claude-sonnet-4-5"]) {
+  test(`ordinary model id ${id} is not mistaken for a secret`, (t) => {
+    const { store, caller } = fixture(t);
+    const ok = clone();
+    ok.profile.bindings[0]!.modelId = id;
+    assert.doesNotThrow(() => validateSetupMetadata(ok));
+    assert.doesNotThrow(() => store.commitSetup(ok, caller));
+  });
+}
+
+test("role and profileId reject invisible format and C1 characters", (t) => {
+  const { store, caller } = fixture(t);
+  const cases: [string, (v: ReturnType<typeof input>) => void][] = [
+    ...(["embedding​", "embedding"] as const).map(
+      (role): [string, (v: ReturnType<typeof input>) => void] => [
+        `appended non-chat role U+${role.charCodeAt(9).toString(16).padStart(4, "0")}`,
+        (v) => {
+          v.profile.bindings.push({
+            role,
+            providerConnectionId: "conn1",
+            connectionRevision: "c1",
+            modelId: "embed-x",
+          } as never);
+        },
+      ],
+    ),
+    ["profileId RLO", (v) => void (v.profile.profileId = "profile‮1")],
+  ];
+  for (const [name, mutate] of cases) {
+    const bad = clone();
+    mutate(bad);
+    const before = store.cursor(W);
+    let error: unknown;
+    try {
+      store.commitSetup(bad, caller);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(store.cursor(W), before, `${name} must append no records`);
+    assert.deepEqual(kinds(store), [], name);
+    assert.ok(code("SETUP_INVALID")(error), name);
+    assert.throws(() => validateSetupMetadata(bad), invalid, name);
+  }
+});

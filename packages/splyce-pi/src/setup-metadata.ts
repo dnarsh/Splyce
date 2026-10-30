@@ -125,7 +125,8 @@ function setupId(value: unknown, field: string, max = 128): string {
     typeof value !== "string" ||
     value.length === 0 ||
     value.length > max ||
-    /[\s\\/\u0000-\u001f\u007f]/u.test(value)
+    /[\s\\/\u0000-\u001f\u007f-\u009f\p{Cf}]/u.test(value) ||
+    SETUP_SECRET.test(value)
   )
     setupInvalid(field);
   return value;
@@ -136,6 +137,7 @@ function setupModelRef(value: unknown, field: string): string {
   } catch {
     return setupInvalid(field);
   }
+  if (SETUP_SECRET.test(value as string)) setupInvalid(field);
   return value as string;
 }
 /** Opaque id that must not look like a secret (requestId). */
@@ -349,7 +351,8 @@ export function validateSetupMetadata(
   } catch {
     return setupInvalid("endpoint.canonicalUrl");
   }
-  if (canonical !== canonicalUrl) setupInvalid("endpoint.canonicalUrl");
+  if (canonical !== canonicalUrl || SETUP_SECRET.test(canonical))
+    setupInvalid("endpoint.canonicalUrl");
   const apiFamily = setupId(e.apiFamily, "endpoint.apiFamily");
   if (!SETUP_API_FAMILIES.includes(apiFamily))
     setupInvalid("endpoint.apiFamily");
