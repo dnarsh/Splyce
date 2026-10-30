@@ -1170,16 +1170,19 @@ for (const id of ["gpt-4o-mini", "claude-sonnet-4-5"]) {
 test("role and profileId reject invisible format and C1 characters", (t) => {
   const { store, caller } = fixture(t);
   const cases: [string, (v: ReturnType<typeof input>) => void][] = [
-    ["role ZWSP", (v) => void (v.profile.bindings[0]!.role = "chat​")],
-    [
-      "role C1",
-      (v) => {
-        v.profile.bindings.push({
-          ...v.profile.bindings[0]!,
-          role: "embedding\u0085",
-        });
-      },
-    ],
+    ...(["embedding​", "embedding"] as const).map(
+      (role): [string, (v: ReturnType<typeof input>) => void] => [
+        `appended non-chat role U+${role.charCodeAt(9).toString(16).padStart(4, "0")}`,
+        (v) => {
+          v.profile.bindings.push({
+            role,
+            providerConnectionId: "conn1",
+            connectionRevision: "c1",
+            modelId: "embed-x",
+          } as never);
+        },
+      ],
+    ),
     ["profileId RLO", (v) => void (v.profile.profileId = "profile‮1")],
   ];
   for (const [name, mutate] of cases) {
