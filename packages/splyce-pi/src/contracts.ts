@@ -942,7 +942,7 @@ export function modelRef(
   requireThat(
     value.length <= 256 &&
       value.isWellFormed() &&
-      !/[\s\u0000-\u001f\u007f-\u009f\p{Cf}︀-️\u{E0100}-\u{E01EF}]/u.test(
+      !/[\s\u0000-\u001f\u007f-\u009f\p{Cf}\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/u.test(
         value,
       ),
     "INVALID_SHAPE",
