@@ -125,7 +125,7 @@ function setupId(value: unknown, field: string, max = 128): string {
     typeof value !== "string" ||
     value.length === 0 ||
     value.length > max ||
-    /[\s\\/\u0000-\u001f\u007f]/u.test(value) ||
+    /[\s\\/\u0000-\u001f\u007f-\u009f\p{Cf}]/u.test(value) ||
     SETUP_SECRET.test(value)
   )
     setupInvalid(field);

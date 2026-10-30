@@ -230,6 +230,25 @@ for (const point of [
   });
 }
 
+for (const [label, text] of [
+  ["a lone high surrogate", "\ud800"],
+  ["a lone low surrogate", "\udc00"],
+  ["U+FE0F", "️"],
+  ["U+FE00", "︀"],
+  ["U+E0100", "\u{e0100}"],
+  ["U+E01EF", "\u{e01ef}"],
+]) {
+  test(`TD-26: profileSnapshot rejects a model reference containing ${label}`, () => {
+    const invalid = copy(boundProfileSnapshot());
+    invalid.bindings[0].modelId = `org/model${text}suffix:v1`;
+    assert.throws(
+      () => validateRecord("profileSnapshot", invalid, context),
+      (error) =>
+        error instanceof ContractError && error.code === "INVALID_SHAPE",
+    );
+  });
+}
+
 test("TD-01: record states, references and numeric bounds fail closed", () => {
   rejects(() => validateRecord("unknown", records.run, context));
   for (const [kind, value] of Object.entries(records)) {

@@ -940,7 +940,11 @@ export function modelRef(
 ): asserts value is string {
   text(value, field);
   requireThat(
-    value.length <= 256 && !/[\s\u0000-\u001f\u007f-\u009f\p{Cf}]/u.test(value),
+    value.length <= 256 &&
+      value.isWellFormed() &&
+      !/[\s\u0000-\u001f\u007f-\u009f\p{Cf}︀-️\u{E0100}-\u{E01EF}]/u.test(
+        value,
+      ),
     "INVALID_SHAPE",
     field,
   );

@@ -1166,3 +1166,31 @@ for (const id of ["gpt-4o-mini", "claude-sonnet-4-5"]) {
     assert.doesNotThrow(() => store.commitSetup(ok, caller));
   });
 }
+
+test("role and profileId reject invisible format and C1 characters", (t) => {
+  const { store, caller } = fixture(t);
+  const cases: [string, (v: ReturnType<typeof input>) => void][] = [
+    ["role ZWSP", (v) => void (v.profile.bindings[0]!.role = "chat​")],
+    [
+      "role C1",
+      (v) => {
+        v.profile.bindings.push({
+          ...v.profile.bindings[0]!,
+          role: "embedding\u0085",
+        });
+      },
+    ],
+    ["profileId RLO", (v) => void (v.profile.profileId = "profile‮1")],
+  ];
+  for (const [name, mutate] of cases) {
+    const bad = clone();
+    mutate(bad);
+    assert.throws(() => validateSetupMetadata(bad), invalid, name);
+    assert.throws(
+      () => store.commitSetup(bad, caller),
+      code("SETUP_INVALID"),
+      name,
+    );
+    assert.deepEqual(kinds(store), [], name);
+  }
+});
