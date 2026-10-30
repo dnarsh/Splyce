@@ -242,3 +242,42 @@ no provider or grant.
 
 The [native option admission record](0014-native-runtime-options.md) covers
 the original-options boundary and its registered-runtime regression.
+
+## Native SDK caller compatibility
+
+[Patch 0013](0013-native-sdk-caller-compatibility.md) records eleven SDK, Agent
+and extension caller paths at historical canonical source
+`8c278114b6ad3ebb7b120bc6c87f2e7b455670ec`. Private caller provenance projects
+only SDK-owned loop plumbing and unchanged generated defaults; explicit semantic
+settings, hooks and inherited option objects refuse. Owned extension compaction,
+MCP changes and UI prompts deny before detached work or effects. The adapter's
+signal-only option admission is unchanged, and no provider or grant is activated.
+
+Starting at exact core `c2ea6a6ad267c8631de178d3cd798f3f9e9f2961`, strict
+application of unchanged 0012 plus 0013 and owner-pinned 0014 reproduces all
+twelve final canonical Git blobs in either 0012→0013→0014 or 0012→0014→0013
+order. 0013 touches eleven paths and excludes ModelRuntime; 0014 owns that file.
+The current 0013 SHA-256 is
+`0a19431abaf9babe1423e2f66d187667385fa3e178d22ba8aaae9e856d67ae4f`.
+See the record for exact dependency pins, freeze digest and replay limits.
+
+Root's source-bound persistence successor passed 78 owned-session, 24 compiled
+persistence and 15 source persistence cases, plus strict SDK compilation and
+physical/event guard-removal checks. Earlier SDK 25, setup 54 and exact renderer
+consumer 5 results retain their individual source bindings. NativeOwner reports
+coding-agent build, SDK 25, owned 78, persistence 24+15, factory 20 and runtime/SDK
+27 passes on a follow-up with the same canonical full tree; this is attributed
+peer evidence, not a new root runtime run or whole-release approval.
+
+The historical canonical 8c source passed the full original vendor check with
+exit 0, including Biome (1,578 files, no fixes), dependency/import/entry-graph and
+install-lock checks, TypeScript 7 and browser smoke. The preceding 8c attempt
+failed because the local vendor TypeScript 7 tooling was missing; the ignored
+dependency setup was repaired without changing source, locks or checks. That
+failure and the older unused-helper failure remain recorded history. These are
+historical receipts, not a new runtime run or qualification of later source.
+Real provider service, an installed successor, exact CI and release support are
+not established here. The separately observed installed 3058 candidate lacked
+later guards and only had a recorded core/unconfigured startup. The persistence
+partial-append crash limit also remains; these checks do not establish atomic
+crash recovery.

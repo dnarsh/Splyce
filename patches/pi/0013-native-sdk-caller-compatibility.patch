@@ -1,0 +1,668 @@
+diff --git a/vendor/pi/packages/agent/src/agent-loop.ts b/vendor/pi/packages/agent/src/agent-loop.ts
+index 4734d4ac3c948e24db7cf7704d516954c858ce29..41a6106cc507c13b2f8e8d05d3515733d8077eef 100644
+--- a/vendor/pi/packages/agent/src/agent-loop.ts
++++ b/vendor/pi/packages/agent/src/agent-loop.ts
+@@ -26,6 +26,7 @@ import {
+ 	assertSplyceToolCurrent,
+ 	getSplyceToolImplementation,
+ 	inheritSplyceLoopConfig,
++	inheritSplyceLoopRequest,
+ 	rethrowSplycePersistenceError,
+ } from "./splyce-readiness.ts";
+ import { getDefaultStreamFn } from "./stream-fn.ts";
+@@ -500,12 +501,14 @@ async function streamAssistantResponse(
+ 	assertSplyceReady(config);
+ 	assertSplyceLoopStream(config, streamFunction);
+ 	signal?.throwIfAborted();
+-	const response = await streamFunction(config.model, llmContext, {
++	const requestOptions = {
+ 		...config,
+ 		apiKey: resolvedApiKey,
+ 		identity: mergeClientIdentity(DEFAULT_AGENT_IDENTITY, config.identity),
+ 		signal,
+-	});
++	};
++	inheritSplyceLoopRequest(config, requestOptions);
++	const response = await streamFunction(config.model, llmContext, requestOptions);
+ 	// Record the requested level, whichever stream function answered.
+ 	const result = async () => Object.assign(await response.result(), { thinkingLevel: config.reasoning ?? "off" });
+ 
+diff --git a/vendor/pi/packages/agent/src/agent.ts b/vendor/pi/packages/agent/src/agent.ts
+index 59a553abb7b14a4e7f1c9de92928abaa91d3f5a4..59d8bfc9ba4566f96d377a9f5d4d6489ca6f6e65 100644
+--- a/vendor/pi/packages/agent/src/agent.ts
++++ b/vendor/pi/packages/agent/src/agent.ts
+@@ -573,6 +573,9 @@ export class Agent {
+ 
+ 	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
+ 		rethrowSplycePersistenceError(error);
++		const code = error && typeof error === "object" ? Object.getOwnPropertyDescriptor(error, "code") : undefined;
++		if (code && "value" in code && code.value === "PROVIDER_OPTIONS_UNSUPPORTED")
++			throw Object.assign(new Error("PROVIDER_OPTIONS_UNSUPPORTED"), { code: "PROVIDER_OPTIONS_UNSUPPORTED" });
+ 		this._state.errorMessage = error instanceof Error ? error.message : String(error);
+ 		if (aborted) return;
+ 		try {
+diff --git a/vendor/pi/packages/agent/src/index.ts b/vendor/pi/packages/agent/src/index.ts
+index d5cedb796986f4e7c34ec215ffb537f13378d178..4b599ae0bb58e3119ff7f82f1ec97083a3714810 100644
+--- a/vendor/pi/packages/agent/src/index.ts
++++ b/vendor/pi/packages/agent/src/index.ts
+@@ -8,6 +8,7 @@ export {
+ 	assertSplyceReady,
+ 	disposeSplyceOwner,
+ 	inheritSplyceOwner,
++	isSplyceLoopRequest,
+ 	isSplyceOwned,
+ 	type SplycePersistenceSanitizer,
+ 	sanitizeSplycePersistence,
+diff --git a/vendor/pi/packages/agent/src/splyce-readiness.ts b/vendor/pi/packages/agent/src/splyce-readiness.ts
+index 7e3bbce3bb8b340cb30bcaf77397709e476ea8c5..12b57950fac1346128f163fb4e7377ca5f3a8921 100644
+--- a/vendor/pi/packages/agent/src/splyce-readiness.ts
++++ b/vendor/pi/packages/agent/src/splyce-readiness.ts
+@@ -38,7 +38,8 @@ function persistenceUnavailable(
+ 
+ /** Persistence refusal must not become an ordinary model/tool fallback response. */
+ export function rethrowSplycePersistenceError(error: unknown): void {
+-	const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
++	const descriptor = error && typeof error === "object" ? Object.getOwnPropertyDescriptor(error, "code") : undefined;
++	const code = descriptor && "value" in descriptor ? descriptor.value : undefined;
+ 	if (code === "PERSIST_REDACTION_UNAVAILABLE" || code === "PERSIST_ENTRY_TOO_LARGE") persistenceUnavailable(code);
+ }
+ 
+@@ -120,6 +121,8 @@ const loopCallbackKeys = [
+ 	"getFollowUpMessages",
+ ];
+ const loopCallbacks = new WeakMap<object, Record<string, unknown>>();
++const loopAgents = new WeakMap<object, Agent>();
++const loopRequests = new WeakMap<object, Map<PropertyKey, unknown>>();
+ const streams = new WeakMap<object, StreamFn>();
+ const toolImplementations = new WeakMap<object, AgentTool["execute"]>();
+ const derivations: Partial<Record<SplyceRole, readonly SplyceRole[]>> = {
+@@ -220,12 +223,38 @@ export function inheritSplyceLoopConfig(parent: object, child: object): void {
+ 	if ((binding.role !== "agent" && binding.role !== "loop-config") || !stream) unavailable();
+ 	bind(binding.owner, child, "loop-config");
+ 	streams.set(child, stream);
++	const agent = binding.role === "agent" ? (parent as Agent) : loopAgents.get(parent);
++	if (!agent) unavailable();
++	loopAgents.set(child, agent);
+ 	loopCallbacks.set(
+ 		child,
+ 		Object.fromEntries(loopCallbackKeys.map((key) => [key, (child as Record<string, unknown>)[key]])),
+ 	);
+ }
+ 
++/** Only the actual loop can preserve the identity of its final provider request. */
++export function inheritSplyceLoopRequest(parent: object, child: object): void {
++	inheritSplyceLoopConfig(parent, child);
++	loopRequests.set(child, new Map(Reflect.ownKeys(child).map((key) => [key, Reflect.get(child, key)])));
++}
++
++/** Comparison only: callers cannot mint a request or attach authority to a copy. */
++export function isSplyceLoopRequest(agent: Agent, request: object): boolean {
++	if (!loopRequests.has(request) || loopAgents.get(request) !== agent) return false;
++	const snapshot = loopRequests.get(request)!;
++	const keys = Reflect.ownKeys(request);
++	const unchanged =
++		keys.length === snapshot.size &&
++		keys.every((key) => {
++			const descriptor = Object.getOwnPropertyDescriptor(request, key);
++			return descriptor && "value" in descriptor && snapshot.has(key) && descriptor.value === snapshot.get(key);
++		});
++	if (!unchanged) return false;
++	assertSameSplyceOwner(agent, request, "loop-config");
++	getSplyceAgentCallbacks(agent);
++	return true;
++}
++
+ export function assertSplyceLoopStream(config: object, stream: StreamFn): void {
+ 	assertSameSplyceOwner(config, config, "loop-config");
+ 	if (streams.get(config) !== stream) unavailable();
+diff --git a/vendor/pi/packages/coding-agent/src/core/agent-session-services.ts b/vendor/pi/packages/coding-agent/src/core/agent-session-services.ts
+index 4178a6c2d52c15b74b9c1214273222531090d874..bf3c4dcc2b802522fafae42257804d86f016ae35 100644
+--- a/vendor/pi/packages/coding-agent/src/core/agent-session-services.ts
++++ b/vendor/pi/packages/coding-agent/src/core/agent-session-services.ts
+@@ -168,16 +168,8 @@ export async function createAgentSessionServices(
+ 		}
+ 	}
+ 	extensionsResult.runtime.pendingProviderRegistrations = [];
+-	for (const { provider, extensionPath } of extensionsResult.runtime.pendingNativeProviderRegistrations) {
+-		try {
+-			modelRuntime.registerNativeProvider(provider);
+-		} catch (error) {
+-			const message = error instanceof Error ? error.message : String(error);
+-			diagnostics.push({
+-				type: "error",
+-				message: `Extension "${extensionPath}" error: ${message}`,
+-			});
+-		}
++	for (const { provider } of extensionsResult.runtime.pendingNativeProviderRegistrations) {
++		await modelRuntime.registerNativeProvider(provider);
+ 	}
+ 	extensionsResult.runtime.pendingNativeProviderRegistrations = [];
+ 	for (const { definition, extensionPath } of extensionsResult.runtime.pendingVirtualModelRegistrations) {
+diff --git a/vendor/pi/packages/coding-agent/src/core/agent-session.ts b/vendor/pi/packages/coding-agent/src/core/agent-session.ts
+index 9716f16ca7198cc00e3b9661c69aae7f444d6d69..3c16dac09c9920921a4906d3f23ccff752e6b7d2 100644
+--- a/vendor/pi/packages/coding-agent/src/core/agent-session.ts
++++ b/vendor/pi/packages/coding-agent/src/core/agent-session.ts
+@@ -32,6 +32,7 @@ import {
+ 	type BeforeToolCallResult,
+ 	disposeSplyceOwner,
+ 	inheritSplyceOwner,
++	isSplyceOwned,
+ 	type PrepareNextTurnContext,
+ 	runToolCall,
+ 	sealSplyceAgentCallbacks,
+@@ -430,6 +431,9 @@ export class AgentSession {
+ 
+ 	// Extension system
+ 	private _extensionRunner!: ExtensionRunner;
++	private _initializeRuntime!: () => Promise<void>;
++	private _runtimeInitialization?: Promise<void>;
++	private _runtimeActive = false;
+ 	private _turnIndex = 0;
+ 	private readonly _entryIdsByMessage = new WeakMap<object, string>();
+ 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
+@@ -545,6 +549,21 @@ export class AgentSession {
+ 		return this._modelRuntime;
+ 	}
+ 
++	/** Await provider registration before using a newly constructed or reloaded runtime. */
++	async initialize(): Promise<void> {
++		assertSplyceReady(this);
++		const runner = this._extensionRunner;
++		this._assertRuntimeCurrent(runner);
++		this._runtimeInitialization ??= this._initializeRuntime();
++		await this._runtimeInitialization;
++		this._assertRuntimeCurrent(runner);
++	}
++
++	private _assertRuntimeCurrent(runner: ExtensionRunner): void {
++		assertSplyceReady(this);
++		if (!this._runtimeActive || runner !== this._extensionRunner) assertSplyceReady();
++	}
++
+ 	private async _getRequiredRequestAuth(
+ 		model: Model<any>,
+ 		signal?: AbortSignal,
+@@ -2238,6 +2257,7 @@ export class AgentSession {
+ 	 */
+ 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+ 		assertSplyceReady(this);
++		await this.initialize();
+ 		if (this._isEmittingAgentSettled) {
+ 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
+ 			return;
+@@ -3525,6 +3545,7 @@ export class AgentSession {
+ 
+ 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+ 		assertSplyceReady(this);
++		await this.initialize();
+ 		if (bindings.uiContext !== undefined) {
+ 			this._extensionUIContext = bindings.uiContext;
+ 		}
+@@ -3627,7 +3648,7 @@ export class AgentSession {
+ 		this.agent.state.model = refreshedModel;
+ 	}
+ 
+-	private _bindExtensionCore(runner: ExtensionRunner): void {
++	private async _bindExtensionCore(runner: ExtensionRunner): Promise<void> {
+ 		if (inheritSplyceOwner(this, runner, "runner")) {
+ 			assertSameSplyceOwner(this, runner, "runner");
+ 		}
+@@ -3656,7 +3677,7 @@ export class AgentSession {
+ 			return [...extensionCommands, ...templates, ...skills];
+ 		};
+ 
+-		runner.bindCore(
++		await runner.bindCore(
+ 			{
+ 				sendMessage: (message, options) => this.sendCustomMessage(message, options),
+ 				sendUserMessage: (content, options) => this.sendUserMessage(content, options),
+@@ -3711,6 +3732,10 @@ export class AgentSession {
+ 				},
+ 				getContextUsage: () => this.getContextUsage(),
+ 				compact: (options) => {
++					if (isSplyceOwned(this))
++						throw Object.assign(new Error("PERSIST_REDACTION_UNAVAILABLE"), {
++							code: "PERSIST_REDACTION_UNAVAILABLE",
++						});
+ 					void (async () => {
+ 						try {
+ 							const result = await this.compact(options?.customInstructions);
+@@ -3731,8 +3756,10 @@ export class AgentSession {
+ 					this._modelRuntime.registerProvider(name, config);
+ 					this._refreshCurrentModelFromRegistry();
+ 				},
+-				registerNativeProvider: (provider) => {
+-					this._modelRuntime.registerNativeProvider(provider);
++				registerNativeProvider: async (provider) => {
++					this._assertRuntimeCurrent(runner);
++					await this._modelRuntime.registerNativeProvider(provider);
++					this._assertRuntimeCurrent(runner);
+ 					this._refreshCurrentModelFromRegistry();
+ 				},
+ 				unregisterProvider: (name) => {
+@@ -3749,6 +3776,7 @@ export class AgentSession {
+ 				},
+ 			},
+ 		);
++		this._assertRuntimeCurrent(runner);
+ 	}
+ 
+ 	private _refreshToolRegistry(options?: { activeToolNames?: string[]; includeAllExtensionTools?: boolean }): void {
+@@ -3906,7 +3934,10 @@ export class AgentSession {
+ 		if (this._extensionRunnerRef) {
+ 			this._extensionRunnerRef.current = this._extensionRunner;
+ 		}
+-		this._bindExtensionCore(this._extensionRunner);
++		const runner = this._extensionRunner;
++		this._runtimeActive = true;
++		this._runtimeInitialization = undefined;
++		this._initializeRuntime = () => this._bindExtensionCore(runner);
+ 		this._applyExtensionBindings(this._extensionRunner);
+ 
+ 		const defaultActiveToolNames = this._baseToolsOverride
+@@ -3924,6 +3955,7 @@ export class AgentSession {
+ 		const oldRunner = this._extensionRunner;
+ 		const previousFlagValues = oldRunner.getFlagValues();
+ 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
++		this._runtimeActive = false;
+ 		oldRunner.invalidate();
+ 		const getDefaultTools = () =>
+ 			this._usesDefaultTools
+@@ -3947,6 +3979,7 @@ export class AgentSession {
+ 			flagValues: previousFlagValues,
+ 			includeAllExtensionTools: true,
+ 		});
++		await this.initialize();
+ 
+ 		const hasBindings =
+ 			this._extensionUIContext ||
+diff --git a/vendor/pi/packages/coding-agent/src/core/extensions/loader.ts b/vendor/pi/packages/coding-agent/src/core/extensions/loader.ts
+index f1c76e92d97f61cdab43c9b4232e2ad423212401..a72d656a2e46de501c19a00202e84cc532c94c03 100644
+--- a/vendor/pi/packages/coding-agent/src/core/extensions/loader.ts
++++ b/vendor/pi/packages/coding-agent/src/core/extensions/loader.ts
+@@ -217,7 +217,8 @@ export function createExtensionRuntime(): ExtensionRuntime {
+ 		registerProvider: (name, config, extensionPath = "<unknown>") => {
+ 			runtime.pendingProviderRegistrations.push({ name, config, extensionPath });
+ 		},
+-		registerNativeProvider: (provider, extensionPath = "<unknown>") => {
++		registerNativeProvider: async (provider, extensionPath = "<unknown>") => {
++			assertActive();
+ 			runtime.pendingNativeProviderRegistrations.push({ provider, extensionPath });
+ 		},
+ 		unregisterProvider: (name) => {
+@@ -249,9 +250,9 @@ function createExtensionAPI(
+ 	runtime: ExtensionRuntime,
+ 	cwd: string,
+ 	eventBus: EventBus,
+-): { api: ExtensionAPI; commit: () => void; discard: () => void } {
++): { api: ExtensionAPI; commit: () => Promise<void>; discard: () => void } {
+ 	const pendingFlagValues = new Map<string, boolean | string>();
+-	const pendingRuntimeChanges: Array<() => void> = [];
++	const pendingRuntimeChanges: Array<() => void | Promise<void>> = [];
+ 	const loadingUnsubscribers: Array<() => void> = [];
+ 	let state: "loading" | "active" | "failed" = "loading";
+ 	const assertActive = () => {
+@@ -260,9 +261,9 @@ function createExtensionAPI(
+ 		}
+ 		runtime.assertActive();
+ 	};
+-	const applyRuntimeChange = (change: () => void) => {
++	const applyRuntimeChange = (change: () => void | Promise<void>) => {
+ 		if (state === "loading") pendingRuntimeChanges.push(change);
+-		else change();
++		else return change();
+ 	};
+ 	const clearPending = () => {
+ 		pendingFlagValues.clear();
+@@ -463,7 +464,9 @@ function createExtensionAPI(
+ 				applyRuntimeChange(() => runtime.registerProvider(providerOrName, config, extension.path));
+ 				return;
+ 			}
+-			applyRuntimeChange(() => runtime.registerNativeProvider(providerOrName, extension.path));
++			return Promise.resolve(
++				applyRuntimeChange(() => runtime.registerNativeProvider(providerOrName, extension.path)),
++			);
+ 		},
+ 
+ 		unregisterProvider(name: string) {
+@@ -532,13 +535,17 @@ function createExtensionAPI(
+ 
+ 	return {
+ 		api,
+-		commit: () => {
++		commit: async () => {
+ 			if (state !== "loading") return;
+ 			runtime.assertActive();
+ 			for (const [name, value] of pendingFlagValues) {
+ 				if (!runtime.flagValues.has(name)) runtime.flagValues.set(name, value);
+ 			}
+-			for (const apply of pendingRuntimeChanges) apply();
++			for (const apply of pendingRuntimeChanges) {
++				runtime.assertActive();
++				await apply();
++			}
++			runtime.assertActive();
+ 			state = "active";
+ 			clearPending();
+ 		},
+@@ -625,7 +632,7 @@ async function initializeExtension(
+ 	const load = createExtensionAPI(extension, runtime, cwd, eventBus);
+ 	try {
+ 		await factory(load.api);
+-		load.commit();
++		await load.commit();
+ 	} catch (error) {
+ 		load.discard();
+ 		throw error;
+diff --git a/vendor/pi/packages/coding-agent/src/core/extensions/runner.ts b/vendor/pi/packages/coding-agent/src/core/extensions/runner.ts
+index 7b4e3507738727bd5a5d705c3ecd908d612b83a9..3f4b25a24e562ca7ecdf9814a000ab3c6f5ba7f1 100644
+--- a/vendor/pi/packages/coding-agent/src/core/extensions/runner.ts
++++ b/vendor/pi/packages/coding-agent/src/core/extensions/runner.ts
+@@ -2,7 +2,7 @@
+  * Extension runner - executes extensions and manages their lifecycle.
+  */
+ 
+-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
++import { type AgentMessage, type AgentTool, assertSplyceReady, isSplyceOwned } from "@earendil-works/pi-agent-core";
+ import {
+ 	getCurrentSystemMessage,
+ 	type ImageContent,
+@@ -277,6 +277,8 @@ function snapshotEventHandlers(extensions: Extension[], event: ExtensionEvent["t
+ 	return extensions.map((ext) => ({ ext, handlers: ext.handlers.get(event)?.slice() ?? [] }));
+ }
+ 
++const denyOwnedNotification = () => assertSplyceReady();
++
+ function rethrowPersistenceError(error: unknown): void {
+ 	const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+ 	if (code === "PERSIST_REDACTION_UNAVAILABLE" || code === "PERSIST_ENTRY_TOO_LARGE")
+@@ -421,17 +423,28 @@ export class ExtensionRunner {
+ 		this.modelRegistry = modelRegistry;
+ 	}
+ 
+-	bindCore(
++	async bindCore(
+ 		actions: ExtensionActions,
+ 		contextActions: ExtensionContextActions,
+ 		providerActions?: {
+ 			registerProvider?: (name: string, config: ProviderConfig) => void;
+-			registerNativeProvider?: (provider: Provider) => void;
++			registerNativeProvider?: (provider: Provider) => Promise<void>;
+ 			unregisterProvider?: (name: string) => void;
+ 			registerVirtualModel?: (definition: VirtualModelDefinition) => void;
+ 			unregisterVirtualModel?: (provider: string, id: string) => void;
+ 		},
+-	): void {
++	): Promise<void> {
++		this.assertActive();
++		if (isSplyceOwned(this) || isSplyceOwned(this.sessionManager)) {
++			// These synchronous notifications cannot propagate awaited persistence failures.
++			if (this.runtime.mcpServers.list().length > 0) assertSplyceReady();
++			for (const method of ["register", "unregister"] as const)
++				Object.defineProperty(this.runtime.mcpServers, method, {
++					value: denyOwnedNotification,
++					writable: false,
++					configurable: false,
++				});
++		}
+ 		// Copy actions into the shared runtime (all extension APIs reference this)
+ 		this.runtime.sendMessage = actions.sendMessage;
+ 		this.runtime.sendUserMessage = actions.sendUserMessage;
+@@ -493,23 +506,16 @@ export class ExtensionRunner {
+ 			}
+ 		}
+ 		this.runtime.pendingProviderRegistrations = [];
+-		for (const { provider, extensionPath } of this.runtime.pendingNativeProviderRegistrations) {
+-			try {
+-				if (providerActions?.registerNativeProvider) {
+-					providerActions.registerNativeProvider(provider);
+-				} else {
+-					this.modelRegistry.registerProvider(provider);
+-				}
+-			} catch (err) {
+-				rethrowPersistenceError(err);
+-				this.emitError({
+-					extensionPath,
+-					event: "register_provider",
+-					error: err instanceof Error ? err.message : String(err),
+-					stack: err instanceof Error ? err.stack : undefined,
+-				});
++		for (const { provider } of this.runtime.pendingNativeProviderRegistrations) {
++			this.assertActive();
++			if (providerActions?.registerNativeProvider) {
++				await providerActions.registerNativeProvider(provider);
++			} else {
++				await this.modelRegistry.registerProvider(provider);
+ 			}
++			this.assertActive();
+ 		}
++		this.assertActive();
+ 		this.runtime.pendingNativeProviderRegistrations = [];
+ 		const registerVirtualModel = (definition: VirtualModelDefinition) => {
+ 			if (providerActions?.registerVirtualModel) providerActions.registerVirtualModel(definition);
+@@ -539,12 +545,14 @@ export class ExtensionRunner {
+ 			}
+ 			this.modelRegistry.registerProvider(name, config);
+ 		};
+-		this.runtime.registerNativeProvider = (provider) => {
++		this.runtime.registerNativeProvider = async (provider) => {
++			this.assertActive();
+ 			if (providerActions?.registerNativeProvider) {
+-				providerActions.registerNativeProvider(provider);
+-				return;
++				await providerActions.registerNativeProvider(provider);
++			} else {
++				await this.modelRegistry.registerProvider(provider);
+ 			}
+-			this.modelRegistry.registerProvider(provider);
++			this.assertActive();
+ 		};
+ 		this.runtime.unregisterProvider = (name) => {
+ 			if (providerActions?.unregisterProvider) {
+@@ -597,6 +605,7 @@ export class ExtensionRunner {
+ 	}
+ 
+ 	private withUIPrompt<T>(kind: UIPromptKind, title: string | undefined, run: () => Promise<T>): Promise<T> {
++		if (isSplyceOwned(this) || isSplyceOwned(this.sessionManager)) assertSplyceReady();
+ 		const outerPrompt = this.uiPromptDepth++ === 0;
+ 		if (outerPrompt) {
+ 			this.activeUIPrompt = { kind, title };
+@@ -750,6 +759,7 @@ export class ExtensionRunner {
+ 		if (this.staleMessage) {
+ 			throw new Error(this.staleMessage);
+ 		}
++		this.runtime.assertActive();
+ 	}
+ 
+ 	onError(listener: ExtensionErrorListener): () => void {
+diff --git a/vendor/pi/packages/coding-agent/src/core/extensions/types.ts b/vendor/pi/packages/coding-agent/src/core/extensions/types.ts
+index a1ebbc2b9e9c0a5a2d6640f2c44c88ac74001459..1a03fa27910d7bf79a5b8f185d7a10223f413cf2 100644
+--- a/vendor/pi/packages/coding-agent/src/core/extensions/types.ts
++++ b/vendor/pi/packages/coding-agent/src/core/extensions/types.ts
+@@ -1820,6 +1820,9 @@ export interface ExtensionAPI {
+ 	 * it is safe to call from command handlers or event callbacks without
+ 	 * requiring a `/reload`.
+ 	 *
++	 * Native provider registrations resolve after queueing during extension loading.
++	 * Startup awaits their registration when the runner binds; later calls await registration directly.
++	 *
+ 	 * @example
+ 	 * // Register a new provider with custom models
+ 	 * pi.registerProvider("my-proxy", {
+@@ -1859,7 +1862,7 @@ export interface ExtensionAPI {
+ 	 *   }
+ 	 * });
+ 	 */
+-	registerProvider(provider: Provider): void;
++	registerProvider(provider: Provider): Promise<void>;
+ 	registerProvider(name: string, config: ProviderConfig): void;
+ 
+ 	/**
+@@ -2178,7 +2181,7 @@ export interface ExtensionRuntimeState {
+ 	 * After bindCore(): calls ModelRegistry directly for immediate effect.
+ 	 */
+ 	registerProvider: (name: string, config: ProviderConfig, extensionPath?: string) => void;
+-	registerNativeProvider: (provider: Provider, extensionPath?: string) => void;
++	registerNativeProvider: (provider: Provider, extensionPath?: string) => Promise<void>;
+ 	unregisterProvider: (name: string, extensionPath?: string) => void;
+ 	/** Servers registered with `pi.registerMcpServer()`. */
+ 	mcpServers: McpServerRegistry;
+diff --git a/vendor/pi/packages/coding-agent/src/core/model-registry.ts b/vendor/pi/packages/coding-agent/src/core/model-registry.ts
+index ffd31756416c38eec8eb1b994618f9ebced4ec57..0a7971825006f85edfd1dee3b2d32c653e069c4c 100644
+--- a/vendor/pi/packages/coding-agent/src/core/model-registry.ts
++++ b/vendor/pi/packages/coding-agent/src/core/model-registry.ts
+@@ -207,15 +207,15 @@ export class ModelRegistry {
+ 		return this.runtime.isUsingOAuth(model.provider);
+ 	}
+ 
+-	registerProvider(provider: Provider): void;
++	registerProvider(provider: Provider): Promise<void>;
+ 	registerProvider(providerName: string, config: ProviderConfigInput): void;
+-	registerProvider(providerOrName: Provider | string, config?: ProviderConfigInput): void {
++	registerProvider(providerOrName: Provider | string, config?: ProviderConfigInput): void | Promise<void> {
+ 		if (typeof providerOrName === "string") {
+ 			if (!config) throw new Error("Provider config is required when registering by name");
+ 			this.runtime.registerProvider(providerOrName, config);
+ 			return;
+ 		}
+-		this.runtime.registerNativeProvider(providerOrName);
++		return this.runtime.registerNativeProvider(providerOrName);
+ 	}
+ 
+ 	unregisterProvider(providerName: string): void {
+diff --git a/vendor/pi/packages/coding-agent/src/core/sdk.ts b/vendor/pi/packages/coding-agent/src/core/sdk.ts
+index 3d8ad8911acd9ec5c200746943bc842a2113a63f..65bc86681122f6672b998446b8efcd01a41b4ba6 100644
+--- a/vendor/pi/packages/coding-agent/src/core/sdk.ts
++++ b/vendor/pi/packages/coding-agent/src/core/sdk.ts
+@@ -6,6 +6,7 @@ import {
+ 	assertSplycePersistence,
+ 	assertSplyceReady,
+ 	inheritSplyceOwner,
++	isSplyceLoopRequest,
+ 	setDefaultStreamFn,
+ 	type ThinkingLevel,
+ } from "@earendil-works/pi-agent-core";
+@@ -297,6 +298,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
+ 		const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
+ 		const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
+ 		const headerRunner = extensionRunnerRef.current;
++		const transformHeaders: ModelsSimpleStreamOptions["transformHeaders"] = headerRunner?.hasHandlers(
++			"before_provider_headers",
++		)
++			? (headers) => headerRunner.emitBeforeProviderHeaders(headers)
++			: undefined;
+ 		return {
+ 			...options,
+ 			timeoutMs: options.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
+@@ -305,10 +311,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
+ 			maxRetryDelayMs: options.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+ 			// Replaces the agent loop's default identity; read per request so telemetry changes apply at once.
+ 			identity: getClientIdentity(settingsManager),
+-			transformHeaders: async (headers) =>
+-				headerRunner?.hasHandlers("before_provider_headers")
+-					? headerRunner.emitBeforeProviderHeaders(headers)
+-					: headers,
++			...(transformHeaders ? { transformHeaders } : {}),
+ 		};
+ 	};
+ 	// Warm only requests for the selected model. Requests a virtual selection routed, or that an
+@@ -354,6 +357,77 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
+ 			model: model.id,
+ 		});
+ 	};
++	const nativeRequestOptions = (options: ModelsSimpleStreamOptions = {}): ModelsSimpleStreamOptions => {
++		const unsupported = (): never => {
++			throw Object.assign(new Error("PROVIDER_OPTIONS_UNSUPPORTED"), { code: "PROVIDER_OPTIONS_UNSUPPORTED" });
++		};
++		if (options === null || typeof options !== "object") unsupported();
++		const prototype = Object.getPrototypeOf(options);
++		if (prototype !== Object.prototype && prototype !== null) unsupported();
++		const runner = extensionRunnerRef.current;
++		const providerHooks = [
++			"before_provider_headers",
++			"before_provider_request",
++			"after_provider_response",
++			"provider_stream_event",
++		] as const;
++		if (providerHooks.some((event) => runner?.hasHandlers(event))) unsupported();
++		// Accessor defaults belong to the donor transport. Explicit settings remain semantics,
++		// even when their value happens to equal one of those defaults.
++		const settings = settingsManager.getSettings();
++		if (
++			settings.transport !== undefined ||
++			settings.httpIdleTimeoutMs !== undefined ||
++			settings.websocketConnectTimeoutMs !== undefined ||
++			settings.thinkingBudgets !== undefined ||
++			Object.values(settings.retry?.provider ?? {}).some((value) => value !== undefined)
++		)
++			unsupported();
++		const projected: Record<string, unknown> = Object.fromEntries(
++			Reflect.ownKeys(options).map((key) => {
++				const descriptor = Object.getOwnPropertyDescriptor(options, key);
++				if (typeof key !== "string" || !descriptor || !("value" in descriptor)) return unsupported();
++				return [key, descriptor.value];
++			}),
++		);
++		if (isSplyceLoopRequest(agent, options)) {
++			// These exact fields have already been consumed by the proven SDK Agent loop.
++			// They are not provider callbacks or provider request options.
++			for (const key of [
++				"model",
++				"convertToLlm",
++				"transformContext",
++				"getApiKey",
++				"beforeToolCall",
++				"afterToolCall",
++				"finishTurn",
++				"prepareRequest",
++				"prepareNextTurn",
++				"getSteeringMessages",
++				"getFollowUpMessages",
++				"toolExecution",
++			])
++				delete projected[key];
++			if (agent.onPayload === transformProviderPayload) delete projected.onPayload;
++			if (agent.onResponse === handleProviderResponse) delete projected.onResponse;
++			if (agent.onProviderStreamEvent === handleProviderStreamEvent) delete projected.onProviderStreamEvent;
++			if (agent.sessionId === agentOptions.sessionId && projected.sessionId === agentOptions.sessionId)
++				delete projected.sessionId;
++			if (agent.transport === agentOptions.transport && projected.transport === agentOptions.transport)
++				delete projected.transport;
++			if (
++				agent.maxRetryDelayMs === agentOptions.maxRetryDelayMs &&
++				projected.maxRetryDelayMs === agentOptions.maxRetryDelayMs
++			)
++				delete projected.maxRetryDelayMs;
++			if (agent.identity === undefined) delete projected.identity;
++		}
++		for (const key of Object.keys(projected)) {
++			if (projected[key] === undefined) delete projected[key];
++			else if (key !== "signal") unsupported();
++		}
++		return projected as ModelsSimpleStreamOptions;
++	};
+ 
+ 	const agentOptions: AgentOptions = {
+ 		initialState: {
+@@ -365,6 +439,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
+ 		},
+ 		convertToLlm: convertToLlmWithBlockImages,
+ 		streamFn: async (model, context, options) => {
++			if (modelRuntime.getRegisteredNativeProvider(model.provider))
++				return modelRuntime.streamSimple(model, context, nativeRequestOptions(options));
+ 			const requestOptions = buildRequestOptions(options);
+ 			// Compaction and summaries use their own routing ids; only session requests
+ 			// replace the cache entry, so warming restarts from them. Keep warming while
+@@ -424,6 +500,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
+ 	};
+ 	inheritSplyceOwner(options, sessionOptions, "session-options");
+ 	const session = new AgentSession(sessionOptions);
++	try {
++		await session.initialize();
++	} catch (error) {
++		session.dispose();
++		throw error;
++	}
+ 
+ 	const extensionsResult = resourceLoader.getExtensions();
+ 
