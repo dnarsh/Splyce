@@ -55,7 +55,11 @@ const stop = (index: number): Ev => ({ event: "content_block_stop", data: { type
 const end: Ev[] = [
 	{
 		event: "message_delta",
-		data: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { input_tokens: 12, output_tokens: 9 } },
+		data: {
+			type: "message_delta",
+			delta: { stop_reason: "tool_use" },
+			usage: { input_tokens: 12, output_tokens: 9 },
+		},
 	},
 	{ event: "message_stop", data: { type: "message_stop" } },
 ];
