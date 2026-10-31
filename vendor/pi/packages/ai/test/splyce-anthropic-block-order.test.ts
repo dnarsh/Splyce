@@ -1,8 +1,8 @@
 // TD-21 / C4 Messages: indexed content blocks keep their arrival order in the final result.
 // Conformance row API_messages_block_usage (research/docs/capabilities/provider-api-conformance.md): "Indexed text/tool/thinking
 // blocks ... preserve order". Real adapter, real SSE parsing; only the HTTP client is replaced, as in
-// splyce-anthropic-stream-safety.test.ts. Thinking blocks are not covered here: they need a reasoning model and signature
-// handling and belong in their own case once the thinking path is exercised against real-catalog data.
+// splyce-anthropic-stream-safety.test.ts. Thinking blocks need signature
+// handling; the last case below covers thinking -> text -> tool with the event shapes of anthropic-sse-parsing.test.ts.
 import type Anthropic from "@anthropic-ai/sdk";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
@@ -30,6 +30,18 @@ const textStart = (index: number): Ev => ({
 const textDelta = (index: number, text: string): Ev => ({
 	event: "content_block_delta",
 	data: { type: "content_block_delta", index, delta: { type: "text_delta", text } },
+});
+const thinkingStart = (index: number, thinking: string, signature: string): Ev => ({
+	event: "content_block_start",
+	data: { type: "content_block_start", index, content_block: { type: "thinking", thinking, signature } },
+});
+const thinkingDelta = (index: number, thinking: string): Ev => ({
+	event: "content_block_delta",
+	data: { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking } },
+});
+const signatureDelta = (index: number, signature: string): Ev => ({
+	event: "content_block_delta",
+	data: { type: "content_block_delta", index, delta: { type: "signature_delta", signature } },
 });
 const toolStart = (index: number, id: string): Ev => ({
 	event: "content_block_start",
@@ -67,7 +79,14 @@ const context = () =>
 	});
 const run = async (events: Ev[]) => streamAnthropic(model, context(), { client: client(sse(events)) }).result();
 
-type Block = { type: string; text?: string; id?: string; arguments?: unknown };
+type Block = {
+	type: string;
+	text?: string;
+	id?: string;
+	arguments?: unknown;
+	thinking?: string;
+	thinkingSignature?: string;
+};
 const blocks = (content: unknown) => content as Block[];
 
 describe("TD-21 Anthropic Messages block order", () => {
@@ -120,5 +139,28 @@ describe("TD-21 Anthropic Messages block order", () => {
 		const calls = blocks(result.content).filter((block) => block.type === "toolCall");
 		expect(calls.map((call) => call.id)).toEqual(["tu_1", "tu_2"]);
 		expect(calls.map((call) => call.arguments)).toEqual([{ path: "/first.txt" }, { path: "/second.txt" }]);
+	});
+
+	it("keeps thinking, then text, then the tool block, with the thinking text and signature intact", async () => {
+		const result = await run([
+			start,
+			thinkingStart(0, "plan", "sig"),
+			thinkingDelta(0, " more"),
+			signatureDelta(0, "+2"),
+			stop(0),
+			textStart(1),
+			textDelta(1, "ok"),
+			stop(1),
+			toolStart(2, "tu_1"),
+			jsonDelta(2, '{"path": "/a.txt"}'),
+			stop(2),
+			...end,
+		]);
+		const content = blocks(result.content);
+		expect(content.map((block) => block.type)).toEqual(["thinking", "text", "toolCall"]);
+		expect(content[0]?.thinking).toBe("plan more");
+		expect(content[0]?.thinkingSignature).toBe("sig+2");
+		expect(content[1]?.text).toBe("ok");
+		expect(content[2]?.arguments).toEqual({ path: "/a.txt" });
 	});
 });
