@@ -352,3 +352,35 @@ test("verifyStale: retargeting, adding or removing a link after capture is stale
   symlinkSync(other, join(root, "extra"), "junction");
   assert.throws(() => verifyStale(snap, root), stale); // added
 });
+
+test("a workspace nested in an unrelated repository: every file is in the manifest and stale checks still fire", () => {
+  // The tracked/untracked split follows the enclosing repository's index and
+  // ignore rules, so it is only a label. Stale verification hashes tracked and
+  // untracked entries and rescans the directory, so every file stays covered.
+  const outer = freshDir();
+  execSync("git init -q", { cwd: outer });
+  execSync("git config user.email test@test.com", { cwd: outer });
+  execSync("git config user.name test", { cwd: outer });
+  const ws = join(outer, "ws");
+  mkdirSync(ws);
+  writeFileSync(join(outer, ".gitignore"), "ignored.txt\n");
+  writeFileSync(join(ws, "tracked.txt"), "t");
+  writeFileSync(join(ws, "untracked.txt"), "u");
+  writeFileSync(join(ws, "ignored.txt"), "i");
+  execSync("git add .gitignore ws/tracked.txt", { cwd: outer });
+  execSync("git commit -q -m init", { cwd: outer });
+
+  const snap = createSnapshot(ws);
+  const covered = [...snap.manifest.tracked, ...snap.manifest.untracked]
+    .map((entry) => entry.path)
+    .sort();
+  assert.deepEqual(covered, ["ignored.txt", "tracked.txt", "untracked.txt"]);
+  const stale = (err: unknown) =>
+    err instanceof SnapshotError && err.code === "STALE_RELEVANT_BYTES";
+  writeFileSync(join(ws, "ignored.txt"), "changed");
+  assert.throws(() => verifyStale(snap, ws), stale); // outer-ignored file edited
+  writeFileSync(join(ws, "ignored.txt"), "i");
+  verifyStale(snap, ws); // restored bytes verify
+  writeFileSync(join(ws, "new.txt"), "n");
+  assert.throws(() => verifyStale(snap, ws), stale); // a new file appears
+});
