@@ -757,11 +757,13 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					usageModel = fallbackCost ? { ...model, id: responseModel, cost: fallbackCost } : model;
 					// Capture initial token usage from message_start event
 					// This ensures we have input token counts even if the stream is aborted early
-					output.usage.input = event.message.usage.input_tokens || 0;
-					output.usage.output = event.message.usage.output_tokens || 0;
-					output.usage.cacheRead = event.message.usage.cache_read_input_tokens || 0;
-					output.usage.cacheWrite = event.message.usage.cache_creation_input_tokens || 0;
-					output.usage.cacheWrite1h = event.message.usage.cache_creation?.ephemeral_1h_input_tokens || 0;
+					const startUsage = event.message.usage;
+					if (!startUsage) throw new Error("Anthropic stream omitted usage in message_start");
+					output.usage.input = startUsage.input_tokens || 0;
+					output.usage.output = startUsage.output_tokens || 0;
+					output.usage.cacheRead = startUsage.cache_read_input_tokens || 0;
+					output.usage.cacheWrite = startUsage.cache_creation_input_tokens || 0;
+					output.usage.cacheWrite1h = startUsage.cache_creation?.ephemeral_1h_input_tokens || 0;
 					// Anthropic doesn't provide total_tokens, compute from components
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
