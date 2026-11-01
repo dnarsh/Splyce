@@ -4,12 +4,58 @@ import ThemeSpecimen from "./ThemeSpecimen.svelte";
 import StateMessage, { STATE_KINDS } from "./StateMessage.svelte";
 import StateSpecimen from "./StateSpecimen.svelte";
 import {
+  CONCRETE_THEMES,
   CONTRAST_PAIRS,
-  THEMES,
   TOKENS,
   TOKEN_NAMES,
   contrastRatio,
+  resolveTheme,
 } from "./tokens";
+
+const DARK_QUERY = "(prefers-color-scheme: dark)";
+const FORCED_QUERY = "(forced-colors: active)";
+type MediaListener = (event: MediaQueryListEvent) => void;
+
+function mockMedia(initial: { dark: boolean; forced: boolean }) {
+  const original = window.matchMedia;
+  const listeners = new Map<string, Set<MediaListener>>();
+  const fake = (query: string): MediaQueryList => {
+    const set = listeners.get(query) ?? new Set<MediaListener>();
+    listeners.set(query, set);
+    return {
+      matches: query === DARK_QUERY ? initial.dark : initial.forced,
+      media: query,
+      onchange: null,
+      addEventListener: (
+        _type: string,
+        listener: EventListenerOrEventListenerObject | null,
+      ) => {
+        if (typeof listener === "function") set.add(listener as MediaListener);
+      },
+      removeEventListener: (
+        _type: string,
+        listener: EventListenerOrEventListenerObject | null,
+      ) => {
+        if (typeof listener === "function")
+          set.delete(listener as MediaListener);
+      },
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => true,
+    } as unknown as MediaQueryList;
+  };
+  window.matchMedia = fake;
+  return {
+    emit(query: string, matches: boolean) {
+      for (const listener of listeners.get(query) ?? []) {
+        listener({ matches, media: query } as MediaQueryListEvent);
+      }
+    },
+    restore() {
+      window.matchMedia = original;
+    },
+  };
+}
 
 const mounted: object[] = [];
 function render(c: unknown, props: Record<string, unknown>) {
@@ -26,7 +72,7 @@ afterEach(() => {
 
 describe("TD-75 theme specimens", () => {
   it("every token pair meets its contrast minimum in every theme", () => {
-    for (const theme of THEMES)
+    for (const theme of CONCRETE_THEMES)
       for (const p of CONTRAST_PAIRS)
         expect(
           contrastRatio(TOKENS[theme][p.fg], TOKENS[theme][p.bg]),
@@ -40,7 +86,7 @@ describe("TD-75 theme specimens", () => {
   });
 
   it("renders every token in every theme with passing text results", () => {
-    for (const theme of THEMES) {
+    for (const theme of CONCRETE_THEMES) {
       const t = render(ThemeSpecimen, { theme });
       for (const name of TOKEN_NAMES) {
         const li = t.querySelector(`[data-token=${name}]`);
@@ -50,6 +96,61 @@ describe("TD-75 theme specimens", () => {
       const rows = t.querySelectorAll("tbody tr");
       expect(rows.length).toBe(CONTRAST_PAIRS.length);
       rows.forEach((r) => expect(r.textContent).toContain("Pass"));
+    }
+  });
+
+  it("resolves system from the OS preference, with forced colors winning", () => {
+    expect(resolveTheme("system", { prefersDark: true })).toBe("dark");
+    expect(resolveTheme("system", { prefersDark: false })).toBe("light");
+    expect(
+      resolveTheme("system", { prefersDark: true, forcedColors: true }),
+    ).toBe("high-contrast");
+    expect(resolveTheme("light", { prefersDark: true })).toBe("light");
+    expect(resolveTheme("light", { forcedColors: true })).toBe("high-contrast");
+  });
+
+  it("renders the resolved system sheet", () => {
+    const dark = render(ThemeSpecimen, { theme: "system", prefersDark: true });
+    const darkSection = dark.querySelector("[data-testid=theme-specimen]")!;
+    expect(darkSection.getAttribute("data-resolved-theme")).toBe("dark");
+    expect(dark.textContent).toContain(TOKENS.dark.surface);
+    expect(dark.textContent).toContain("system (dark)");
+
+    const hc = render(ThemeSpecimen, {
+      theme: "system",
+      prefersDark: false,
+      forcedColors: true,
+    });
+    const hcSection = hc.querySelector("[data-testid=theme-specimen]")!;
+    expect(hcSection.getAttribute("data-resolved-theme")).toBe("high-contrast");
+    expect(hc.textContent).toContain(TOKENS["high-contrast"].selection);
+    expect(hc.textContent).toContain("system (high-contrast)");
+  });
+
+  it("follows live system preference and forced-colors changes", () => {
+    const media = mockMedia({ dark: false, forced: false });
+    try {
+      const t = render(ThemeSpecimen, { theme: "system" });
+      const section = () => t.querySelector("[data-testid=theme-specimen]")!;
+      expect(section().getAttribute("data-resolved-theme")).toBe("light");
+
+      media.emit(DARK_QUERY, true);
+      flushSync();
+      expect(section().getAttribute("data-resolved-theme")).toBe("dark");
+      expect(t.textContent).toContain("system (dark)");
+
+      media.emit(FORCED_QUERY, true);
+      flushSync();
+      expect(section().getAttribute("data-resolved-theme")).toBe(
+        "high-contrast",
+      );
+      expect(t.textContent).toContain("system (high-contrast)");
+
+      media.emit(FORCED_QUERY, false);
+      flushSync();
+      expect(section().getAttribute("data-resolved-theme")).toBe("dark");
+    } finally {
+      media.restore();
     }
   });
 

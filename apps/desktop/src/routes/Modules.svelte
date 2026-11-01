@@ -8,8 +8,11 @@
     modulesView,
     operationView,
     selectionState,
+    type ModuleRowView,
     type ModuleSnapshot,
   } from "../stores/modules";
+  import OptionalStateHelp from "../components/OptionalStateHelp.svelte";
+  import { moduleOptionalState } from "./module-optional-state";
 
   type Dialog =
     | { readonly kind: "add" }
@@ -54,6 +57,9 @@
   const operation = $derived(operationView(snapshot, snapshot.operation));
   const addState = $derived(addModuleState(snapshot));
   const addSelection = $derived(selectionState(snapshot, addSelected));
+  // TD-68: only the optional states the snapshot proves; never inferred.
+  const optionalState = (row: ModuleRowView) =>
+    moduleOptionalState(row, snapshot);
   // Narrowing helpers: keep the id as a plain value before the callback.
   const dialogPackageId = $derived(
     dialog && dialog.kind !== "add" ? dialog.packageId : null,
@@ -326,6 +332,7 @@
     {:else}
       <ul class="module-rows">
         {#each view.rows as row (row.packageId)}
+          {@const optional = optionalState(row)}
           <li data-testid="module-row" data-package-id={row.packageId}>
             <header class="row-header">
               <h3>{row.title}</h3>
@@ -350,6 +357,11 @@
               <dt>Retained data</dt>
               <dd data-testid="retained-data">{row.retainedLabel}</dd>
             </dl>
+            {#if optional}
+              <div class="row-help" data-testid="module-row-help">
+                <OptionalStateHelp state={optional} feature={row.title} />
+              </div>
+            {/if}
             {#if row.cleanupLabel}
               <p class="banner" role="alert">{row.cleanupLabel}</p>
             {/if}
@@ -471,6 +483,9 @@
                 </label>
                 {#if option.selectBlockedReason}
                   <p class="blocker" role="alert">{option.selectBlockedReason}</p>
+                {/if}
+                {#if !option.selectable}
+                  <OptionalStateHelp state="unsupported" feature={option.title} />
                 {/if}
                 <dl>
                   <dt>Source</dt><dd>{option.sourceLabel}</dd>
@@ -706,6 +721,9 @@
     display: flex;
     align-items: center;
     gap: 12px;
+  }
+  .row-help {
+    margin-top: 8px;
   }
   .row-header h3 {
     margin: 0;

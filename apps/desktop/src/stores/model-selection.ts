@@ -2,6 +2,13 @@ import type { SelectionTransitionRecord } from "@splyce/pi/contracts";
 
 export type Disposition = SelectionTransitionRecord["disposition"];
 
+/**
+ * The state of the model catalog feed. `ready` means the options handed to the
+ * switcher are the engine's current catalog; `loading` and `error` mean the
+ * catalog has not been read, which is not the same as an engine with no models.
+ */
+export type ModelCatalogStatus = "ready" | "loading" | "error";
+
 /** `requested` is local intent before the engine has recorded a transition. */
 export type TransitionStatus =
   "requested" | "pending" | "applied" | "rejected" | "canceled";

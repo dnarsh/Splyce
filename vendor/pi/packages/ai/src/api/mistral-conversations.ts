@@ -1,4 +1,13 @@
 import { calculateCost, clampThinkingLevel } from "../models.ts";
+import {
+	assertCredentialApiIdentity,
+	assertCredentialOptions,
+	CredentialPreflightError,
+	createLeasedFetch,
+	redactEventWithLease,
+	redactResponseWithLease,
+	redactWithLease,
+} from "../splyce-credentials.ts";
 import type {
 	AssistantMessage,
 	Message,
@@ -131,14 +140,32 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 	const stream = new AssistantMessageEventStream();
 	const normalizedContext = resolveTranscript(context, model.compat?.supportsMidConvoSystemMessages);
 
+	// Captured before any caller callback runs: onPayload may mutate options, and error/observer paths must keep the
+	// credentials the call was admitted with.
+	const leasedCredentials = options?.credentials;
 	(async () => {
 		const output = createOutput(model);
 
 		try {
-			const apiKey = options?.apiKey;
+			assertCredentialApiIdentity(model.api, "mistral-conversations", options);
+			assertCredentialOptions(options ?? {}, model.headers);
+			// Splyce: with a lease the request carries a placeholder and a fetch that leases the real key on every send.
+			const credentials = leasedCredentials;
+			const apiKey = credentials ? "splyce-leased-placeholder" : options?.apiKey;
 			if (!apiKey) {
 				throw new Error(`No API key for provider: ${model.provider}`);
 			}
+			const requestOptions: MistralOptions | undefined = credentials
+				? {
+						...options,
+						fetch: createLeasedFetch(
+							credentials,
+							"authorization",
+							options?.fetch,
+							(secret) => `Bearer ${secret}`,
+						),
+					}
+				: options;
 
 			const normalizeMistralToolCallId = createMistralToolCallIdNormalizer();
 			const transformedMessages = transformMessages(normalizedContext.messages, model, (id) =>
@@ -150,9 +177,20 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 			if (nextPayload !== undefined) {
 				payload = nextPayload as MistralChatPayload;
 			}
-			const mistralStream = await requestMistralStream(model, payload, apiKey, options);
+			const mistralStream = await requestMistralStream(model, payload, apiKey, requestOptions);
 			stream.push({ type: "start", partial: output });
-			await consumeChatStream(model, output, stream, mistralStream, options?.onProviderStreamEvent);
+			await consumeChatStream(
+				model,
+				output,
+				stream,
+				mistralStream,
+				options?.onProviderStreamEvent &&
+					(async (chunk, m) =>
+						options.onProviderStreamEvent?.(
+							(await redactEventWithLease(leasedCredentials, chunk)) as typeof chunk,
+							m,
+						)),
+			);
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -168,8 +206,13 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			// An errored or aborted response never carries tool calls into dispatch or persistence.
+			output.content = output.content.filter((block) => block.type !== "toolCall");
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatMistralError(error);
+			output.errorMessage = await redactWithLease(
+				error instanceof CredentialPreflightError ? undefined : leasedCredentials,
+				formatMistralError(error),
+			);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -187,7 +230,7 @@ export const streamSimple: StreamFunction<"mistral-conversations", SimpleStreamO
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
 	const apiKey = options?.apiKey;
-	if (!apiKey) {
+	if (!apiKey && !options?.credentials) {
 		throw new Error(`No API key for provider: ${model.provider}`);
 	}
 
@@ -319,7 +362,13 @@ async function requestMistralStream(
 		combinedSignal.cleanup();
 	}
 
-	await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+	await options?.onResponse?.(
+		await redactResponseWithLease(options?.credentials, {
+			status: response.status,
+			headers: headersToRecord(response.headers),
+		}),
+		model,
+	);
 
 	if (!response.ok) {
 		const body = await response.text();

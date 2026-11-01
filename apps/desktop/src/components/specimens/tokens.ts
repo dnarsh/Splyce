@@ -1,7 +1,16 @@
-// Semantic token specimens (TD-75). Proposed values pending MdSiddiqx approval;
-// consumers must read tokens, never hard-code colours.
-export const THEMES = ["light", "dark", "high-contrast"] as const;
+// Semantic token specimens (TD-75). Selection values are the follow-up proposal
+// pending MdSiddiqx sign-off; consumers must read tokens, never hard-code colours.
+export const CONCRETE_THEMES = ["light", "dark", "high-contrast"] as const;
+export type ConcreteTheme = (typeof CONCRETE_THEMES)[number];
+
+export const THEMES = ["light", "dark", "system", "high-contrast"] as const;
 export type ThemeName = (typeof THEMES)[number];
+
+// TD-75 follow-up: retune selection in one place; values need design sign-off.
+export const PROPOSED_SELECTION = {
+  selection: "#1d72c8",
+  selectionText: "#ffffff",
+} as const;
 
 export const TOKEN_NAMES = [
   "surface",
@@ -19,47 +28,62 @@ export const TOKEN_NAMES = [
 export type TokenName = (typeof TOKEN_NAMES)[number];
 export type TokenSheet = Readonly<Record<TokenName, string>>;
 
-export const TOKENS: Readonly<Record<ThemeName, TokenSheet>> = Object.freeze({
-  light: {
-    surface: "#ffffff",
-    surfaceRaised: "#f3f3f3",
-    text: "#1a1a1a",
-    textMuted: "#595959",
-    border: "#767676",
-    focus: "#005fb8",
-    selection: "#cce4f7",
-    selectionText: "#1a1a1a",
-    danger: "#b00020",
-    pending: "#8a5a00",
-    positive: "#1b6e3c",
-  },
-  dark: {
-    surface: "#1e1e1e",
-    surfaceRaised: "#2b2b2b",
-    text: "#f0f0f0",
-    textMuted: "#b3b3b3",
-    border: "#8c8c8c",
-    focus: "#60cdff",
-    selection: "#264f78",
-    selectionText: "#ffffff",
-    danger: "#ff8a8a",
-    pending: "#e5b45a",
-    positive: "#6fcf97",
-  },
-  "high-contrast": {
-    surface: "#000000",
-    surfaceRaised: "#000000",
-    text: "#ffffff",
-    textMuted: "#ffffff",
-    border: "#ffffff",
-    focus: "#ffff00",
-    selection: "#1aebff",
-    selectionText: "#000000",
-    danger: "#ff9d9d",
-    pending: "#ffff00",
-    positive: "#7dff7d",
-  },
-});
+export const TOKENS: Readonly<Record<ConcreteTheme, TokenSheet>> =
+  Object.freeze({
+    light: {
+      surface: "#ffffff",
+      surfaceRaised: "#f3f3f3",
+      text: "#1a1a1a",
+      textMuted: "#595959",
+      border: "#767676",
+      focus: "#005fb8",
+      selection: PROPOSED_SELECTION.selection,
+      selectionText: PROPOSED_SELECTION.selectionText,
+      danger: "#b00020",
+      pending: "#8a5a00",
+      positive: "#1b6e3c",
+    },
+    dark: {
+      surface: "#1e1e1e",
+      surfaceRaised: "#2b2b2b",
+      text: "#f0f0f0",
+      textMuted: "#b3b3b3",
+      border: "#8c8c8c",
+      focus: "#60cdff",
+      selection: PROPOSED_SELECTION.selection,
+      selectionText: PROPOSED_SELECTION.selectionText,
+      danger: "#ff8a8a",
+      pending: "#e5b45a",
+      positive: "#6fcf97",
+    },
+    "high-contrast": {
+      surface: "#000000",
+      surfaceRaised: "#000000",
+      text: "#ffffff",
+      textMuted: "#ffffff",
+      border: "#ffffff",
+      focus: "#ffff00",
+      selection: "#1aebff",
+      selectionText: "#000000",
+      danger: "#ff9d9d",
+      pending: "#ffff00",
+      positive: "#7dff7d",
+    },
+  });
+
+export interface ThemePreference {
+  readonly prefersDark?: boolean;
+  readonly forcedColors?: boolean;
+}
+
+export function resolveTheme(
+  theme: ThemeName,
+  preference: ThemePreference = {},
+): ConcreteTheme {
+  if (preference.forcedColors) return "high-contrast";
+  if (theme !== "system") return theme;
+  return preference.prefersDark ? "dark" : "light";
+}
 
 export interface ContrastPair {
   readonly fg: TokenName;
@@ -73,6 +97,7 @@ export const CONTRAST_PAIRS: readonly ContrastPair[] = [
   { fg: "text", bg: "surfaceRaised", min: 4.5 },
   { fg: "textMuted", bg: "surface", min: 4.5 },
   { fg: "selectionText", bg: "selection", min: 4.5 },
+  { fg: "selection", bg: "surface", min: 3 },
   { fg: "danger", bg: "surface", min: 4.5 },
   { fg: "pending", bg: "surface", min: 4.5 },
   { fg: "positive", bg: "surface", min: 4.5 },

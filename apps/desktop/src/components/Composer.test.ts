@@ -8,6 +8,7 @@ type Props = {
   connection: EngineConnectionState;
   sessionId: string | null;
   stale?: boolean;
+  generationReady?: boolean;
   cancellable?: boolean;
   contextArtifactIds?: string[];
   send: (p: PromptPayload) => Promise<void>;
@@ -26,6 +27,9 @@ function setup(over: Partial<Props> = {}) {
   const props: Props = {
     connection: "ready",
     sessionId: "ses_1",
+    // Default the harness to an enabled composer; the fail-closed cases opt in
+    // to generationReady: false explicitly.
+    generationReady: true,
     send,
     cancel,
     ...over,
@@ -128,7 +132,7 @@ describe("TD-71 composer", () => {
     expect(c.ta.value).toBe("");
   });
 
-  it("keeps the draft and shows the error when send fails", async () => {
+  it("keeps the draft and shows honest fixed copy when send fails", async () => {
     const c = setup({
       send: vi.fn(async () => {
         throw new Error("engine said no");
@@ -139,7 +143,62 @@ describe("TD-71 composer", () => {
     await tick();
     await tick();
     expect(c.ta.value).toBe("keep me");
-    expect(c.status()).toContain("engine said no");
+    // Behaviour change (TD-71): the rejection text is no longer echoed, so this
+    // asserts the fixed copy instead of the raw message it used to show.
+    expect(c.status()).toContain("may not have reached");
+    expect(c.status()).not.toContain("engine said no");
+  });
+
+  it("blocks send with the contract copy when generation is unconfigured", async () => {
+    const c = setup({ generationReady: false });
+    c.type("hi");
+    c.key({ key: "Enter" });
+    await tick();
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.status()).toContain("Generation unconfigured");
+    expect(c.sendBtn().disabled).toBe(true);
+  });
+
+  it("never claims generation is unconfigured before the engine reports it", async () => {
+    // Undefined is "not reported", not "not configured". Telling a user to
+    // connect a provider when a provider is connected is a false statement.
+    const c = setup({ generationReady: undefined });
+    c.type("hi");
+    c.key({ key: "Enter" });
+    await tick();
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.status()).toContain("has not been reported");
+    expect(c.status()).not.toContain("Generation unconfigured");
+    expect(c.sendBtn().disabled).toBe(true);
+  });
+
+  it("sends once a generation port is reported ready", async () => {
+    const c = setup({ generationReady: true });
+    c.type("hi");
+    c.key({ key: "Enter" });
+    await tick();
+    await tick();
+    expect(c.send).toHaveBeenCalledExactlyOnceWith({ text: "hi" });
+  });
+
+  it("never echoes a raw rejection: fixed copy, draft kept, no path or secret", async () => {
+    const c = setup({
+      generationReady: true,
+      send: vi.fn(async () => {
+        throw new Error(
+          "ENOENT C:\\Users\\bob\\.ssh\\id_rsa at Object.<anonymous> sk-secret123",
+        );
+      }),
+    });
+    c.type("keep me");
+    c.key({ key: "Enter" });
+    await tick();
+    await tick();
+    expect(c.ta.value).toBe("keep me");
+    expect(c.status()).not.toMatch(
+      /ENOENT|\.ssh|sk-secret|Object\.<anonymous>/,
+    );
+    expect(c.status()).toMatch(/may not have reached/i);
   });
 
   it.each([

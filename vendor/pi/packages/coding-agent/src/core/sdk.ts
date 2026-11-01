@@ -1,36 +1,27 @@
-import { join } from "node:path";
 import {
 	Agent,
 	type AgentMessage,
+	type AgentOptions,
+	assertSameSplyceOwner,
 	assertSplyceReady,
+	inheritSplyceOwner,
 	setDefaultStreamFn,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import type { ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
-import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { AgentSession } from "./agent-session.ts";
-import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
+import { AgentSession, type AgentSessionConfig } from "./agent-session.ts";
 import { CacheWarmer } from "./cache-warmer.ts";
 import { getClientIdentity } from "./client-identity.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { createToolNameMatcher } from "./mcp-servers.ts";
 import { convertToLlm } from "./messages.ts";
-import { findInitialModel } from "./model-resolver.ts";
-import { ModelRuntime } from "./model-runtime.ts";
+import type { ModelRuntime } from "./model-runtime.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
-import { DefaultResourceLoader } from "./resource-loader.ts";
-import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
-import {
-	applyToolModifiers,
-	DEFAULT_TOOL_NAMES,
-	getToolListError,
-	isToolModifier,
-	SettingsManager,
-} from "./settings-manager.ts";
-import { time } from "./timings.ts";
+import type { SessionManager } from "./session-manager.ts";
+import { getToolListError, type SettingsManager } from "./settings-manager.ts";
 import {
 	createBashTool,
 	createCodingTools,
@@ -44,7 +35,6 @@ import {
 	createWriteTool,
 	withFileMutationQueue,
 } from "./tools/index.ts";
-import { getBranchSelection } from "./virtual-models.ts";
 
 // Preserve the pre-0.81 fallback for extensions that construct Agent instances
 // or invoke low-level agent loops without supplying streamFn. Agent core remains
@@ -155,10 +145,6 @@ export {
 
 // Helper Functions
 
-function getDefaultAgentDir(): string {
-	return getAgentDir();
-}
-
 /**
  * Create an AgentSession with the specified options.
  *
@@ -195,67 +181,33 @@ function getDefaultAgentDir(): string {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	assertSplyceReady();
-	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
-	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
-	let resourceLoader = options.resourceLoader;
-
-	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
-	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
-	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath }));
-
-	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
-	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
-
-	if (!resourceLoader) {
-		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
-		await resourceLoader.reload();
-		time("resourceLoader.reload");
+	assertSplyceReady(options);
+	assertSameSplyceOwner(options, options, "sdk-options");
+	if (
+		!options.cwd ||
+		!options.agentDir ||
+		!options.model ||
+		!options.modelRuntime ||
+		!options.sessionManager ||
+		!options.settingsManager ||
+		!options.resourceLoader ||
+		!Array.isArray(options.tools)
+	) {
+		throw Object.assign(new Error("SPLYCE_UNAVAILABLE"), { code: "SPLYCE_UNAVAILABLE" });
 	}
+	const { model, modelRuntime, settingsManager, sessionManager, resourceLoader } = options;
+	assertSameSplyceOwner(options, model, "model");
+	assertSameSplyceOwner(options, modelRuntime, "model-runtime");
+	assertSameSplyceOwner(options, settingsManager, "settings-manager");
+	assertSameSplyceOwner(options, sessionManager, "session-manager");
+	assertSameSplyceOwner(options, resourceLoader, "resource-loader");
+	for (const scoped of options.scopedModels ?? []) assertSameSplyceOwner(options, scoped.model, "model");
+	const cwd = resolvePath(options.cwd);
 
 	// Check if session has existing data to restore
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
-
-	let model = options.model;
-	let modelFallbackMessage: string | undefined;
-
-	// Assistant messages name the physical model that answered, so a virtual selection is only in
-	// model_change entries.
-	const sessionModel = getBranchSelection(sessionManager.getBranch(), (provider, modelId) =>
-		modelRuntime.getModel(provider, modelId),
-	);
-
-	// If session has data, try to restore model from it
-	if (!model && hasExistingSession && sessionModel) {
-		const restoredModel = modelRuntime.getModel(sessionModel.provider, sessionModel.modelId);
-		if (restoredModel && modelRuntime.hasConfiguredAuth(restoredModel.provider)) {
-			model = restoredModel;
-		}
-		if (!model) {
-			modelFallbackMessage = `Could not restore model ${sessionModel.provider}/${sessionModel.modelId}`;
-		}
-	}
-
-	// If still no model, use findInitialModel (checks settings default, then provider defaults)
-	if (!model) {
-		const result = await findInitialModel({
-			scopedModels: [],
-			isContinuing: hasExistingSession,
-			defaultProvider: settingsManager.getDefaultProvider(),
-			defaultModelId: settingsManager.getDefaultModel(),
-			defaultThinkingLevel: settingsManager.getDefaultThinkingLevel(),
-			modelThinkingLevels: settingsManager.getAllModelThinkingLevels(),
-			modelRuntime,
-		});
-		model = result.model;
-		if (!model) {
-			modelFallbackMessage = formatNoModelsAvailableMessage();
-		} else if (modelFallbackMessage) {
-			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
-		}
-	}
 
 	let thinkingLevel = options.thinkingLevel;
 
@@ -286,19 +238,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const toolListError = options.tools ? getToolListError(options.tools) : undefined;
 	if (toolListError) throw new Error(`Invalid tools option: ${toolListError}`);
-	const defaultToolNames = options.noTools ? [] : (settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES);
-	// A `tools` list of only `+name`/`-name` entries changes the default selection instead of
-	// replacing it, like the `defaultTools` setting.
-	const toolModifiers = options.tools?.some(isToolModifier) ? options.tools : undefined;
-	const selectedToolNames = toolModifiers ? applyToolModifiers(defaultToolNames, toolModifiers) : options.tools;
-	const allowedToolNames = toolModifiers
-		? options.noTools === "all"
-			? selectedToolNames
-			: undefined
-		: (options.tools ?? (options.noTools === "all" ? [] : undefined));
+	if (options.tools.some((name) => name.startsWith("+") || name.startsWith("-"))) {
+		throw new Error("Owned sessions require an explicit tool allowlist");
+	}
+	const allowedToolNames = options.tools;
 	const excludedToolNames = options.excludeTools;
 	const isExcludedTool = excludedToolNames ? createToolNameMatcher(excludedToolNames) : undefined;
-	const initialActiveToolNames = (selectedToolNames ?? defaultToolNames).filter((name) => !isExcludedTool?.(name));
+	const initialActiveToolNames = options.tools.filter((name) => !isExcludedTool?.(name));
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
@@ -407,7 +353,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 	};
 
-	const agent = new Agent({
+	const agentOptions: AgentOptions = {
 		initialState: {
 			systemPrompt: "",
 			model,
@@ -442,7 +388,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
-	});
+	};
+	inheritSplyceOwner(options, agentOptions, "agent-options");
+	const agent = new Agent(agentOptions);
 
 	// Restore missing settings metadata for older sessions.
 	if (hasExistingSession) {
@@ -457,7 +405,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
 
-	const session = new AgentSession({
+	const sessionOptions: AgentSessionConfig = {
 		agent,
 		sessionManager,
 		settingsManager,
@@ -468,19 +416,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		modelRuntime,
 		cacheWarmer,
 		initialActiveToolNames,
-		usesDefaultTools: (options.tools === undefined || toolModifiers !== undefined) && !options.noTools,
-		defaultToolModifiers: toolModifiers,
+		usesDefaultTools: false,
 		allowedToolNames,
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
-	});
+	};
+	inheritSplyceOwner(options, sessionOptions, "session-options");
+	const session = new AgentSession(sessionOptions);
 
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {
 		session,
 		extensionsResult,
-		modelFallbackMessage,
 	};
 }

@@ -6,25 +6,27 @@ Reading order follows a first session: [setup](#1-first-launch-and-setup), [sess
 
 ## What is wired today
 
-| Area                  | In the running app (`apps/desktop/src/App.svelte`)                            | Built but not yet reachable from the app                           |
-| --------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| Shell and navigation  | Rail, conversation pane, evidence pane, composer footer, Views navigation     | Command palette, shortcut reference, settings and help panels      |
-| Sessions              | Session tree (select, focus, refresh, lost-selection notice, subscribe retry) | Fork, resume and rewind actions (TD-33)                            |
-| Conversation          | Live transcript and tool cards                                                | Run outcome panel (TD-36); approval controls (TD-30)               |
-| Composer              | Present; sending is disabled with a stated reason                             | Sending (session revisions are not delivered to the renderer yet)  |
-| Providers and usage   | Providers view (disabled, empty), Usage view (unavailable)                    | Connection cards, custom endpoint form, model switcher, usage rows |
-| Setup and modules     | Not present                                                                   | Setup and Modules screens (TD-29, open pull request)               |
-| Memory, diff, plugins | Not present                                                                   | Memory list, diff and verification views, plugin details           |
+| Area                  | In the running app (`apps/desktop/src/App.svelte`)                        | Built but not yet reachable from the app                           |
+| --------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Shell and navigation  | Rail, conversation pane, evidence pane, composer footer, Views navigation | Command palette, shortcut reference, settings and help panels      |
+| Sessions              | Session tree, empty in a real launch (no session loader in `main.ts`)     | Fork, resume and rewind actions (TD-33)                            |
+| Conversation          | Transcript and tool cards (need a loaded session)                         | Run outcome panel (TD-36); approval controls (TD-30)               |
+| Composer              | Present; sending is disabled with a stated reason                         | Sending (session revisions are not delivered to the renderer yet)  |
+| Providers and usage   | Providers view (disabled, empty), Usage view (unavailable)                | Connection cards, custom endpoint form, model switcher, usage rows |
+| Setup and modules     | Setup and Modules screens, shown read-only: no setup service is connected | Catalog, plans and installs (need TD-27/28 and the engine events)  |
+| Memory, diff, plugins | Not present                                                               | Memory list, diff and verification views, plugin details           |
 
 ## 1. First launch and setup
 
 The design is in [the setup flow](../research/docs/design/setup-flow.md): the primary action is **Continue with base only**, and **Skip setup** is a valid way to finish. Neither needs the network, a catalog, a credential or a model, and nothing optional is selected, fetched or enabled. The app opens straight into the workbench, which says **Engine unavailable** until the engine reports ready.
 
-- **Today:** the app has no setup screen. It starts in the workbench described below, which is the same place Continue and Skip lead to.
-- **Not yet:** the Setup and Modules screens exist as components with fixture-driven tests (TD-29) but are not routed in the app. Until they are, no module can be installed, enabled or removed from the interface.
+- **Today:** the app starts in the workbench described below. **Setup** and **Modules** are in the Views navigation, but no setup or module service is connected, so both open read-only with an **Engine unavailable** banner. **Modules** shows its **Catalog unavailable** reason at once; **Setup** shows it only after you choose to select optional modules. **Continue with base only** and **Skip setup** lead to the workbench.
+- **Not yet:** nothing can be installed, enabled or removed from the interface; there is no catalog, plan or install until the engine reports module state (TD-27, TD-28 and the engine events).
 - **Failure and recovery:** when the engine is not ready, the status badge in the rail shows its state, the conversation pane shows the unavailable banner, and the session tree says **Sessions could not be loaded** with a Retry button instead of looking empty.
 
 ## 2. Choosing a session
+
+**Status:** the app entry (`apps/desktop/src/main.ts`) mounts the app without a session loader, so a real launch has no sessions to choose. The behaviour below is covered by component tests and applies once a snapshot service is wired.
 
 The rail lists sessions as a tree of branches. Each entry shows its session and branch, how many leaves it has, and a text badge reading **Selected** or **Not selected**, so state is never colour-only.
 
@@ -41,7 +43,7 @@ The conversation pane shows the live transcript for the selected session: stream
 
 - The composer sits in the footer. Enter or Ctrl+Enter sends, Shift+Enter inserts a newline, and Esc cancels only when a run can be cancelled. Empty drafts cannot be sent, and a draft is kept if sending fails.
 - **Sending is unavailable today.** The composer's own status line gives the reason in order: the engine is not connected or busy, **No session is selected**, then **Sending is not available yet**. No message leaves the app.
-- Approval cards are shown as read-only context. Approve and deny controls are hidden until a session context with its current revisions exists.
+- Approval cards are not shown yet: the app passes `showApprovalControls={false}`, which omits the whole card, so only the pending tool context appears. Approve and deny arrive with TD-30.
 
 The run outcome panel (`components/RunOutcome.svelte`, TD-36) is built but not mounted, so the transcript does not yet show a separate outcome line per run.
 
@@ -54,7 +56,7 @@ Sources: `components/Composer.svelte`, `stores/composer.ts`, `components/TurnStr
 
 ## 5. Optional modules
 
-Not reachable yet. The design shows a plan before anything changes: exact source and pin, required dependencies separated from your selection, sizes (**Unknown** with its reason, never 0 B), and any step that runs code listed separately. Installing and enabling are two separate choices with separate outcomes; disabling is not uninstalling; deleting data is a third, separate confirmation.
+Reachable but read-only today (see [setup](#1-first-launch-and-setup)). The design shows a plan before anything changes: exact source and pin, required dependencies separated from your selection, sizes (**Unknown** with its reason, never 0 B), and any step that runs code listed separately. Installing and enabling are two separate choices with separate outcomes; disabling is not uninstalling; deleting data is a third, separate confirmation.
 
 ## 6. Recovery and unavailable states
 

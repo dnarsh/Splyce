@@ -7,6 +7,7 @@ import {
   createModelSelection,
   requestSwitch,
   type ModelOption,
+  type ModelCatalogStatus,
   type ModelSelectionState,
 } from "../../stores/model-selection";
 
@@ -55,6 +56,9 @@ function render(
   extra: {
     turnActive?: boolean;
     onRequest?: (r: string, d: string) => void;
+    options?: ModelOption[];
+    catalogStatus?: ModelCatalogStatus;
+    stale?: boolean;
   } = {},
 ) {
   cmp = mount(ModelSwitcher, {
@@ -198,5 +202,90 @@ describe("ModelSwitcher", () => {
     );
     render(s);
     expect(document.querySelector("fieldset")!.disabled).toBe(true);
+  });
+
+  it("says the catalog is loading instead of showing an empty picker", () => {
+    render(createModelSelection("bind_a"), {
+      options: [],
+      catalogStatus: "loading",
+    });
+
+    expect(text("model-catalog-loading")).toContain(
+      "Loading the model catalog",
+    );
+    expect(
+      document
+        .querySelector('[data-testid="model-switcher"]')!
+        .getAttribute("aria-busy"),
+    ).toBe("true");
+    // The active binding is engine truth and stays visible while it loads; with
+    // no catalog there is no label to invent, so it shows the binding ref.
+    expect(text("model-current")).toBe("Active: bind_a");
+    expect(document.querySelector("fieldset")).toBeNull();
+    expect(text("model-catalog-empty")).toBe("");
+  });
+
+  it("a refresh during loading keeps the known models pickable", () => {
+    render(createModelSelection("bind_a"), { catalogStatus: "loading" });
+
+    expect(text("model-catalog-loading")).toContain("Loading");
+    expect(document.querySelectorAll('input[value^="bind_"]').length).toBe(
+      options.length,
+    );
+  });
+
+  it("a failed catalog is an alert and never claims there are no models", () => {
+    // Even with previously known options, a failed catalog offers no picker: a
+    // switch must not be committed against a catalog the engine did not confirm.
+    render(createModelSelection("bind_a"), { catalogStatus: "error" });
+
+    const alert = document.querySelector<HTMLElement>(
+      '[data-testid="model-catalog-error"]',
+    )!;
+    expect(alert.getAttribute("role")).toBe("alert");
+    expect(alert.textContent).toContain("could not be loaded");
+    expect(document.body.textContent).not.toContain("reported no models");
+    expect(document.querySelector("fieldset")).toBeNull();
+    expect(document.querySelectorAll('input[value^="bind_"]').length).toBe(0);
+  });
+
+  it("an empty catalog is stated rather than rendered as a bare fieldset", () => {
+    render(createModelSelection("bind_a"), { options: [] });
+
+    expect(text("model-catalog-empty")).toContain("reported no models");
+    expect(document.querySelector("fieldset")).toBeNull();
+    expect(text("model-catalog-loading")).toBe("");
+  });
+
+  it("a stale catalog is marked as possibly out of date", () => {
+    render(createModelSelection("bind_a"), { stale: true });
+
+    expect(text("model-catalog-stale")).toContain("may be out of date");
+    expect(document.querySelectorAll('input[value^="bind_"]').length).toBe(
+      options.length,
+    );
+    unmount(cmp!);
+    document.body.innerHTML = "";
+    render(createModelSelection("bind_a"));
+    expect(text("model-catalog-stale")).toBe("");
+  });
+
+  it("a stale empty catalog still carries the warning", () => {
+    // Empty and stale are independent facts: the engine reported nothing AND
+    // the report may be behind. Saying only "no models" hides the second one.
+    render(createModelSelection("bind_a"), { options: [], stale: true });
+
+    expect(text("model-catalog-empty")).toContain("reported no models");
+    expect(text("model-catalog-stale")).toContain("may be out of date");
+  });
+
+  it("a failed catalog never borrows the stale warning", () => {
+    render(createModelSelection("bind_a"), {
+      catalogStatus: "error",
+      stale: true,
+    });
+
+    expect(text("model-catalog-error")).toContain("could not be loaded");
+    expect(text("model-catalog-stale")).toBe("");
   });
 });

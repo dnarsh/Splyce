@@ -6,6 +6,10 @@ import {
 } from "@earendil-works/pi-agent-core";
 import { NativePolicy } from "../packages/splyce-pi/dist/policy.js";
 import { Store } from "../packages/splyce-pi/dist/store.js";
+import {
+  IDENTITY,
+  MemoryWorkspaceIdentity,
+} from "./fixtures/native-grants.mjs";
 
 const [dir, encodedPermit, mode] = process.argv.slice(2);
 const permit = JSON.parse(encodedPermit);
@@ -39,11 +43,14 @@ const caller = {
             record.actionId === id,
         )),
 };
-const policy = new NativePolicy(store, caller, () => ({
-  ...caller,
-  grantIds: ["grant1"],
-  planMode: false,
-}));
+const identity = new MemoryWorkspaceIdentity();
+identity.set(permit.ownership.workspaceId, IDENTITY);
+const policy = new NativePolicy(
+  store,
+  caller,
+  () => ({ ...caller, grantIds: [permit.grantId], planMode: false }),
+  identity,
+);
 policy.authorize(permit);
 const tool = {
   name: "fixture_write",

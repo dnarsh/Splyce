@@ -10,24 +10,39 @@ export interface ComposerAvailability {
   stale: boolean;
   /** A prompt was already sent and is not settled yet. */
   pending: boolean;
+  /**
+   * Engine-reported generation readiness.
+   *
+   * `true` = the engine proved a generation port is ready.
+   * `false` = the engine proved it is NOT configured (no profile/model).
+   * `undefined` = readiness was not reported, which is not the same claim.
+   *
+   * Fail closed: anything but `true` blocks sending.
+   */
+  generationReady?: boolean;
   /** Sending is not wired for this session yet; shown as the blocked reason. */
   unavailable?: string;
 }
 
-const CONNECTION_REASONS: Partial<Record<EngineConnectionState, string>> = {
-  disconnected: "Engine is not connected.",
-  connecting: "Engine is still connecting.",
-  unavailable: "Engine is unavailable.",
-  error: "Engine reported an error.",
-  busy: "A turn is running. Press Esc to cancel it.",
-};
-
 /** Honest reason sending is blocked, or null when allowed. */
 export function sendBlockedReason(a: ComposerAvailability): string | null {
   if (a.pending) return "Sending the previous message.";
-  const connection = CONNECTION_REASONS[a.connection];
-  if (connection) return connection;
+  if (a.connection === "disconnected") return "Engine is not connected.";
+  if (a.connection === "connecting") return "Engine is still connecting.";
+  if (a.connection === "error") return "Engine reported an error.";
+  if (a.connection === "busy")
+    return "A turn is running. Press Esc to cancel it.";
   if (!a.sessionId) return "No session is selected.";
+  // Contract (commons/backend-frontend-contracts.md): generation=false must read
+  // "Generation unconfigured" and keep send disabled, so the generation gate
+  // wins over the wiring gap. Once generation is true, the wiring gap is shown.
+  if (a.generationReady === false)
+    return "Generation unconfigured. Connect a provider and select a model.";
+  if (a.connection === "unavailable") return "Engine is unavailable.";
+  // Unreported is its own state: the engine has not said whether generation is
+  // configured, so claiming it is unconfigured would be a false statement.
+  if (a.generationReady !== true)
+    return "Generation readiness has not been reported yet. Sending stays blocked.";
   if (a.unavailable) return a.unavailable;
   if (a.stale) return "Session state is out of date. Refresh before sending.";
   return null;

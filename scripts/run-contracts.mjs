@@ -17,6 +17,16 @@ const require = createRequire(import.meta.url);
 const tsc = join(dirname(dirname(require.resolve("typescript"))), "bin", "tsc");
 for (const command of [
   [tsc, "-p", "packages/splyce-pi/tsconfig.json"],
+  [
+    tsc,
+    "--noEmit",
+    "--strict",
+    "--target",
+    "ES2024",
+    "--module",
+    "NodeNext",
+    "tests/provider-admission.types.ts",
+  ],
   ["--test", "tests/contracts.test.mjs"],
 ]) {
   const result = spawnSync(process.execPath, command, {

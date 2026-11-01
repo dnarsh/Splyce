@@ -16,6 +16,7 @@ import {
   actionArgumentsDigest,
 } from "../packages/splyce-pi/dist/policy.js";
 import { Store } from "../packages/splyce-pi/dist/store.js";
+import { admitAndGrant } from "./fixtures/native-grants.mjs";
 import { NestedToolCallRunner } from "../vendor/pi/packages/coding-agent/dist/core/nested-tool-calls.js";
 
 const records = JSON.parse(
@@ -71,7 +72,7 @@ async function fixture(t) {
     policyRevision: "policy1",
     resolveReference(id, scope) {
       return (
-        scope === "w-demo" &&
+        (scope === "w-demo" || fixtureRefs.has(scope)) &&
         (fixtureRefs.has(id) ||
           store
             .list(scope)
@@ -84,17 +85,27 @@ async function fixture(t) {
       );
     },
   };
-  store.append({ kind: "run", record: records.run }, caller);
-  const ownership = store.acquireWorkspace("w-demo", "s1");
-  let active = { ...caller, grantIds: ["grant1"], planMode: false };
-  const policy = new NativePolicy(store, caller, () => active);
   const args = { text: "changed" };
+  const granted = admitAndGrant(store, caller, fixtureRefs, records, {
+    actionId: "a1",
+    argumentsDigest: actionArgumentsDigest(args),
+  });
+  let run = granted.run;
+  store.append({ kind: "run", record: run }, caller);
+  const ownership = store.acquireWorkspace(granted.workspaceId, "s1");
+  let active = { ...caller, grantIds: [granted.grantId], planMode: false };
+  const policy = new NativePolicy(
+    store,
+    caller,
+    () => active,
+    granted.identity,
+  );
   const permit = {
     toolCallId: "call-1",
     toolName: "fixture_write",
     actionId: "a1",
     runRecordId: "rec-run",
-    grantId: "grant1",
+    grantId: granted.grantId,
     parentActionId: null,
     capabilityId: "cap1",
     capabilityVersion: "1",
@@ -103,6 +114,7 @@ async function fixture(t) {
     targetScopeId: "w-demo",
     idempotencyKey: "effect-1",
     ownership,
+    capability: "fs.write",
   };
   policy.authorize(permit);
   let after = 0;
@@ -159,6 +171,27 @@ async function fixture(t) {
     ownership,
     policy,
     permit,
+    workspaceId: granted.workspaceId,
+    grantId: granted.grantId,
+    identity: granted.identity,
+    get run() {
+      return run;
+    },
+    get grantIds() {
+      return active.grantIds;
+    },
+    /** Mints a once grant for another action and adds it to the run and live grant set. */
+    grant(actionId) {
+      const grantId = granted.mint(actionId);
+      run = {
+        ...run,
+        recordId: `rec-run-${actionId}`,
+        grantIds: [...run.grantIds, grantId],
+      };
+      store.append({ kind: "run", record: run }, caller);
+      active = { ...active, grantIds: [...active.grantIds, grantId] };
+      return grantId;
+    },
     tool,
     unbind,
     call,
@@ -286,6 +319,7 @@ test("native adapter prepares only schema-validated arguments then runs real pol
         ...f.permit,
         toolCallId: id,
         actionId: `action-${id}`,
+        grantId: f.grant(`action-${id}`),
         idempotencyKey: `effect-${id}`,
       });
       f.policy.reserve(id, name, signal);
@@ -396,6 +430,7 @@ for (const interruption of ["blocked", "aborted"]) {
       ...f.permit,
       toolCallId: "fresh",
       actionId: "fresh-action",
+      grantId: f.grant("fresh-action"),
       idempotencyKey: "fresh-effect",
     });
     assert.equal(
@@ -462,7 +497,7 @@ for (const change of [
         if (change === "planMode") f.setActive({ planMode: true });
         if (change === "config") f.setActive({ configRevision: "cfg2" });
         if (change === "ownership")
-          f.store.renewWorkspace("w-demo", "s1", f.ownership.epoch);
+          f.store.renewWorkspace(f.workspaceId, "s1", f.ownership.epoch);
         if (change === "arguments") args.text = "different";
       },
     };
@@ -508,7 +543,7 @@ test("terminal run record revokes a permit bound to its older running record", a
   f.store.append(
     {
       kind: "run",
-      record: { ...records.run, recordId: "run-terminal", state: "completed" },
+      record: { ...f.run, recordId: "run-terminal", state: "completed" },
     },
     f.caller,
   );
@@ -523,17 +558,28 @@ test("terminal parent cannot authorize a nested action through its old intent", 
   const f = await fixture(t);
   await runToolCall(f.call, f.options);
   await writeFile(f.canary, "after-parent");
+  // Isolate parent state from the earlier rejection of consumed grants.
+  f.policy.authorize({
+    ...f.permit,
+    toolCallId: "terminal-parent",
+    grantId: f.grant(f.permit.actionId),
+  });
+  assert.doesNotThrow(
+    () => f.policy.check("terminal-parent", f.permit.toolName, undefined),
+    "the terminal-parent fixture has a currently valid Store grant",
+  );
   f.policy.authorize({
     ...f.permit,
     toolCallId: "child",
     actionId: "child-action",
+    grantId: f.grant("child-action"),
     idempotencyKey: "child-effect",
     parentActionId: "a1",
   });
   await assert.rejects(
     runToolCall(
       { ...f.call, id: "child" },
-      { ...f.options, parentToolCallId: f.call.id },
+      { ...f.options, parentToolCallId: "terminal-parent" },
     ),
     {
       code: "PARENT_NOT_RUNNING",
@@ -604,6 +650,7 @@ test("real nested execution joins the running native parent action", async (t) =
     ...f.permit,
     toolCallId: `${f.call.id}/1`,
     actionId: "child-action",
+    grantId: f.grant("child-action"),
     idempotencyKey: "child-effect",
     parentActionId: f.permit.actionId,
   });
@@ -662,6 +709,7 @@ for (const mismatch of [
       ...f.permit,
       toolCallId: "child",
       actionId: "child-action",
+      grantId: f.grant("child-action"),
       idempotencyKey: "child-effect",
       parentActionId: mismatch === "root" ? null : f.permit.actionId,
     });
@@ -784,7 +832,7 @@ registerHooks({load(url, context, next) {
   if (process.env.SPLYCE_ADMISSION_MUTATION === 'reservation-fence' && url.endsWith('/splyce-pi/dist/store.js')) {
     const source = String(result.source);
     const start = source.indexOf('            if (expectedActionReservation !== undefined) {');
-    const end = source.indexOf('            const seqs = [];', start);
+    const end = source.indexOf('            if (workspaceAdmission !== undefined) {', start);
     if (start < 0 || end < 0) throw new Error('reservation fence mutation target missing');
     return {...result, source: source.slice(0, start) + source.slice(end)};
   }
@@ -822,9 +870,9 @@ registerHooks({load(url, context, next) {
     if (start < 0 || end < 0) throw new Error('authority mutation target missing');
     source = source.slice(0, start) + '    check() {}\\n' + source.slice(end);
   } else {
-    const start = source.indexOf('this.store.appendBatch(', source.indexOf('    async execute('));
+    const start = source.indexOf('this.store.consumeOnceGrant(', source.indexOf('    async execute('));
     if (start < 0) throw new Error('intent mutation target missing');
-    let depth = 1, end = start + 'this.store.appendBatch('.length;
+    let depth = 1, end = start + 'this.store.consumeOnceGrant('.length;
     for (; depth && end < source.length; end++) {
       if (source[end] === '(') depth++;
       if (source[end] === ')') depth--;
@@ -959,11 +1007,16 @@ for (const outcome of ["completed", "uncertain"]) {
     f.unbind();
     const reopened = Store.open(f.path);
 
-    const policy = new NativePolicy(reopened, f.caller, () => ({
-      ...f.caller,
-      grantIds: ["grant1"],
-      planMode: false,
-    }));
+    const policy = new NativePolicy(
+      reopened,
+      f.caller,
+      () => ({
+        ...f.caller,
+        grantIds: [f.grantId],
+        planMode: false,
+      }),
+      f.identity,
+    );
     policy.authorize(f.permit);
     const unbind = bindSplyceToolAdmission(f.tool, policy);
     t.after(unbind);
@@ -1006,6 +1059,7 @@ test("canceled ID cannot run argument preparation and fresh ID recovers", async 
     ...f.permit,
     toolCallId: "new",
     actionId: "new-action",
+    grantId: f.grant("new-action"),
     idempotencyKey: "new-effect",
   });
   assert.equal(
@@ -1084,11 +1138,16 @@ test("blocked or failed hooks never leave an executable native preparation", asy
 test("another policy cannot reuse an in-flight identity before argument callbacks", async (t) => {
   const f = await fixture(t);
   const secondStore = Store.open(f.path);
-  const other = new NativePolicy(secondStore, f.caller, () => ({
-    ...f.caller,
-    grantIds: ["grant1"],
-    planMode: false,
-  }));
+  const other = new NativePolicy(
+    secondStore,
+    f.caller,
+    () => ({
+      ...f.caller,
+      grantIds: [f.grantId],
+      planMode: false,
+    }),
+    f.identity,
+  );
   other.authorize(f.permit);
   const tool = {
     ...f.tool,
@@ -1251,11 +1310,16 @@ for (const terminal of ["proposed", "canceled"]) {
         expectedStates,
         "durable history must survive reopen",
       );
-      const policy = new NativePolicy(second, f.caller, () => ({
-        ...f.caller,
-        grantIds: ["grant1"],
-        planMode: false,
-      }));
+      const policy = new NativePolicy(
+        second,
+        f.caller,
+        () => ({
+          ...f.caller,
+          grantIds: f.grantIds,
+          planMode: false,
+        }),
+        f.identity,
+      );
       policy.authorize(f.permit);
       const unbind = bindSplyceToolAdmission(f.tool, policy);
       try {
@@ -1278,6 +1342,7 @@ for (const terminal of ["proposed", "canceled"]) {
           ...f.permit,
           toolCallId: "fresh-reopened",
           actionId: "fresh-reopened-action",
+          grantId: f.grant("fresh-reopened-action"),
           idempotencyKey: "fresh-reopened-effect",
         });
         assert.equal(
@@ -1309,11 +1374,16 @@ test("terminal reservation write failure remains conservatively fenced", async (
   assert.equal(await readFile(f.canary, "utf8"), "unchanged");
   const reopened = Store.open(f.path);
   try {
-    const policy = new NativePolicy(reopened, f.caller, () => ({
-      ...f.caller,
-      grantIds: ["grant1"],
-      planMode: false,
-    }));
+    const policy = new NativePolicy(
+      reopened,
+      f.caller,
+      () => ({
+        ...f.caller,
+        grantIds: [f.grantId],
+        planMode: false,
+      }),
+      f.identity,
+    );
     policy.authorize(f.permit);
     assert.throws(() => policy.reserve(f.call.id, f.call.name, undefined), {
       code: "ACTION_REQUIRES_RECONCILIATION",
@@ -1370,11 +1440,16 @@ test("process death after proposal leaves durable replay fence", async (t) => {
         .map(({ record }) => record.state),
       ["proposed"],
     );
-    const policy = new NativePolicy(reopened, f.caller, () => ({
-      ...f.caller,
-      grantIds: ["grant1"],
-      planMode: false,
-    }));
+    const policy = new NativePolicy(
+      reopened,
+      f.caller,
+      () => ({
+        ...f.caller,
+        grantIds: [f.grantId],
+        planMode: false,
+      }),
+      f.identity,
+    );
     policy.authorize(f.permit);
     assert.throws(() => policy.reserve(f.call.id, f.call.name, undefined), {
       code: "ACTION_REQUIRES_RECONCILIATION",

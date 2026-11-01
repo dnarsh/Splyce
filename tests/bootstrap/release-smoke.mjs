@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { createWriteStream } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { constants, createWriteStream } from "node:fs";
+import { resolve, dirname, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import { finished } from "node:stream/promises";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const target = resolve(root, "apps/desktop/src-tauri/target");
@@ -18,15 +19,77 @@ const tauriDriverInventory = resolve(
   "tests/bootstrap/tauri-driver-inventory.json",
 );
 
-export function assertUnavailable(state) {
+export function sanitizeSmokeDiagnostics(report, driverLog) {
+  const redact = (value) => {
+    for (const directory of [root, process.env.USERPROFILE, process.env.HOME]) {
+      if (directory) {
+        value = value
+          .replaceAll(directory, "<local>")
+          .replaceAll(directory.replaceAll("\\", "/"), "<local>");
+      }
+    }
+    return value
+      .replace(/\b[A-Za-z]:[\\/][^\r\n"'<>]*/g, "<path>")
+      .replace(/\\\\[^\r\n"'<>]+/g, "<path>")
+      .replace(/(\/session\/)[^/\s"']+/g, "$1<session>")
+      .replace(
+        /\b(?:authorization|password|token|api[_-]?key|secret)\b[^\r\n]*/gi,
+        "<redacted>",
+      );
+  };
+  // Public CI artifacts omit DOM text, screenshots and process/path inventories.
+  const fields = [
+    "case",
+    "passed",
+    "pins",
+    "appSha256",
+    "driverSha256",
+    "edgeSha256",
+    "edgeArchiveSha256",
+    "webviewVersion",
+    "webviewScope",
+    "edgeDriverVersion",
+    "failedRequest",
+    "sessionRequestElapsedMs",
+    "webviewDebugging",
+    "applicationElevation",
+    "runnerProfile",
+    "nativeSessionObservation",
+    "failureProcesses",
+    "failureProcessInspection",
+    "nativeDriverStdout",
+    "error",
+    "captureError",
+    "sessionCleanup",
+    "driverCleanup",
+    "cleanupInspection",
+  ];
+  const result = Object.fromEntries(
+    fields
+      .filter((name) => report[name] !== undefined)
+      .map((name) => [name, report[name]]),
+  );
+  return {
+    result: JSON.stringify(
+      result,
+      (_key, value) => (typeof value === "string" ? redact(value) : value),
+      2,
+    ),
+    driverLog: redact(driverLog.slice(-65536)),
+  };
+}
+
+export function assertGenerationUnconfigured(state) {
   assert.equal(state.connection, "unavailable");
   assert.deepEqual(state.readiness, {
-    policy: "false",
-    store: "false",
-    receipts: "false",
+    policy: "true",
+    store: "true",
+    receipts: "true",
   });
   assert.equal(state.banner, true);
+  assert.equal(state.bannerHeading, "Generation unconfigured");
   assert.equal(state.ready, false);
+  assert.equal(state.sendDisabled, true);
 }
 
 function powershell(script) {
@@ -46,6 +109,193 @@ function processes() {
     "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CreationDate | ConvertTo-Json -Compress",
   );
   return JSON.parse(result || "[]");
+}
+
+export function webviewDebuggingFlags(commandLine) {
+  const match = commandLine.match(
+    /(?:^|\s|")--remote-debugging-port(?:=|\s+)"?(\d+)"?(?=$|\s|")/,
+  );
+  const port = match ? Number(match[1]) : null;
+  return {
+    port: Number.isInteger(port) && port >= 0 && port <= 65535 ? port : null,
+    pipe: /(?:^|\s|")--remote-debugging-pipe(?:$|\s|")/.test(commandLine),
+  };
+}
+
+export function webviewOverrideFlags(commandLine, requestedFolder) {
+  // Respect Windows quoting so a switch inside another argument's value is not evidence.
+  const args = [];
+  let arg = "",
+    quoted = false,
+    started = false;
+  for (let i = 0; i < commandLine.length; i++) {
+    let slashes = 0;
+    while (commandLine[i] === "\\") {
+      slashes++;
+      i++;
+    }
+    if (commandLine[i] === '"') {
+      arg += "\\".repeat(Math.floor(slashes / 2));
+      if (slashes % 2) arg += '"';
+      else if (quoted && commandLine[i + 1] === '"') {
+        arg += '"';
+        i++;
+      } else quoted = !quoted;
+      started = true;
+    } else {
+      arg += "\\".repeat(slashes);
+      if (i === commandLine.length) break;
+      if (/\s/.test(commandLine[i]) && !quoted) {
+        if (started) args.push(arg);
+        arg = "";
+        started = false;
+      } else {
+        arg += commandLine[i];
+        started = true;
+      }
+    }
+  }
+  if (started) args.push(arg);
+  const folderIndex = args.indexOf("--user-data-dir");
+  const actualFolder =
+    args.find((value) => value.startsWith("--user-data-dir="))?.slice(16) ??
+    (folderIndex >= 0 ? args[folderIndex + 1] : undefined);
+  return {
+    disableGpu: args.includes("--disable-gpu"),
+    requestedFolderMatch: requestedFolder
+      ? Boolean(actualFolder) &&
+        win32.normalize(actualFolder).toLowerCase() ===
+          win32.normalize(requestedFolder).toLowerCase()
+      : null,
+  };
+}
+
+export function processElevation(candidate) {
+  const unknown = { status: "unknown", elevated: null };
+  const serializedDate = candidate?.CreationDate;
+  const legacyDate =
+    typeof serializedDate === "string" &&
+    serializedDate.match(/^\/Date\((\d+)\)\/$/);
+  const creationMs = legacyDate
+    ? Number(legacyDate[1])
+    : Date.parse(serializedDate);
+  if (
+    !Number.isSafeInteger(candidate?.ProcessId) ||
+    candidate.ProcessId <= 0 ||
+    !Number.isSafeInteger(creationMs)
+  )
+    return unknown;
+  try {
+    const result = JSON.parse(
+      execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-File",
+          resolve(root, "tests/bootstrap/process-elevation.ps1"),
+          "-ProcessId",
+          String(candidate.ProcessId),
+          "-CreationTimeMs",
+          String(creationMs),
+        ],
+        { encoding: "utf8", windowsHide: true, timeout: 15000 },
+      ),
+    );
+    return result.status === "observed" && typeof result.elevated === "boolean"
+      ? { status: "observed", elevated: result.elevated }
+      : unknown;
+  } catch {
+    return unknown;
+  }
+}
+
+async function webviewDebuggingState(owned) {
+  const ids = owned
+    .filter((candidate) => webViewVersionFromProcess(candidate))
+    .map((candidate) => candidate.ProcessId)
+    .filter((id) => Number.isSafeInteger(id) && id > 0);
+  if (!ids.length) return { declaredPorts: [], pipe: false, endpoints: [] };
+  const filter = ids.map((id) => "ProcessId=" + id).join(" OR ");
+  const commands = JSON.parse(
+    powershell(
+      "ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process -Filter '" +
+        filter +
+        "' | Select-Object ProcessId,CreationDate,CommandLine)",
+    ),
+  ).filter((candidate) =>
+    owned.some((original) => sameProcess(candidate, original)),
+  );
+  const liveIds = commands.map((candidate) => candidate.ProcessId);
+  if (!liveIds.length) return { declaredPorts: [], pipe: false, endpoints: [] };
+  const flags = commands.map((candidate) =>
+    webviewDebuggingFlags(candidate.CommandLine || ""),
+  );
+  const overrides = commands
+    .filter(
+      (candidate) =>
+        typeof candidate.CommandLine === "string" &&
+        candidate.CommandLine.length > 0,
+    )
+    .map((candidate) =>
+      webviewOverrideFlags(
+        candidate.CommandLine,
+        process.env.WEBVIEW2_USER_DATA_FOLDER,
+      ),
+    );
+  const sockets = JSON.parse(
+    powershell(
+      "ConvertTo-Json -Compress -InputObject @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -in @(" +
+        liveIds.join(",") +
+        ") -and $_.LocalAddress -in @('127.0.0.1', '::1', '0.0.0.0', '::') } | Select-Object LocalAddress,LocalPort)",
+    ),
+  );
+  const endpoints = await Promise.all(
+    sockets
+      .filter(
+        (socket) =>
+          Number.isInteger(socket.LocalPort) &&
+          socket.LocalPort > 0 &&
+          socket.LocalPort <= 65535,
+      )
+      .slice(0, 8)
+      .map(async (socket) => {
+        const host = socket.LocalAddress.includes(":") ? "[::1]" : "127.0.0.1";
+        const endpoint = { host, port: socket.LocalPort };
+        try {
+          const response = await fetch(
+            "http://" + host + ":" + socket.LocalPort + "/json/version",
+            { signal: AbortSignal.timeout(1000) },
+          );
+          const details = await response.json().catch(() => null);
+          return {
+            ...endpoint,
+            status: response.status,
+            devtools:
+              response.ok && typeof details?.webSocketDebuggerUrl === "string",
+          };
+        } catch (error) {
+          return { ...endpoint, error: error.name };
+        }
+      }),
+  );
+  return {
+    declaredPorts: [
+      ...new Set(
+        flags.map((flag) => flag.port).filter((port) => port !== null),
+      ),
+    ],
+    pipe: flags.some((flag) => flag.pipe),
+    observedCommandCount: overrides.length,
+    disableGpu: overrides.length
+      ? overrides.some((flag) => flag.disableGpu)
+      : null,
+    requestedFolderMatch:
+      overrides.length && process.env.WEBVIEW2_USER_DATA_FOLDER
+        ? overrides.some((flag) => flag.requestedFolderMatch)
+        : null,
+    endpoints,
+  };
 }
 
 function installedWebViewRuntime() {
@@ -179,7 +429,7 @@ export async function runSmoke() {
   );
   await mkdir(artifacts, { recursive: true });
   const report = {
-    case: "bootstrap-unavailable-release",
+    case: "bootstrap-generation-unconfigured-release",
     passed: false,
     app,
     pins: {
@@ -195,9 +445,11 @@ export async function runSmoke() {
   let session;
   let application;
   let engine;
+  let sessionRequestStartedAt;
   const port = 4444;
   const base = `http://127.0.0.1:${port}`;
   async function request(method, path, body) {
+    report.lastRequest = { method, path };
     const response = await fetch(`${base}${path}`, {
       method,
       headers: { "content-type": "application/json" },
@@ -216,6 +468,8 @@ export async function runSmoke() {
     connection: shell?.dataset.connectionState,
     readiness: {policy:shell?.dataset.readinessPolicy,store:shell?.dataset.readinessStore,receipts:shell?.dataset.readinessReceipts},
     banner: !!document.querySelector('[data-testid="unavailable-banner"]'),
+    bannerHeading: document.querySelector('[data-testid="unavailable-banner"] h2')?.textContent,
+    sendDisabled: document.querySelector('form[aria-label="Composer"] button[type="submit"]')?.disabled,
     ready: !!document.querySelector('.workspace-view'),
     text: document.body.innerText,
     origin: location.origin
@@ -283,9 +537,11 @@ export async function runSmoke() {
       assert.equal(child.exitCode, null, "tauri-driver exited before startup");
       return (await request("GET", "/status")).ready;
     }, "owned tauri-driver startup");
+    sessionRequestStartedAt = Date.now();
     const created = await request("POST", "/session", {
       capabilities: { alwaysMatch: { "tauri:options": { application: app } } },
     });
+    report.sessionRequestElapsedMs = Date.now() - sessionRequestStartedAt;
     session = created.sessionId;
     assert(session, "WebDriver session ID is required");
     assert.equal(
@@ -334,8 +590,12 @@ export async function runSmoke() {
     const unavailable = await until(async () => {
       const value = await state();
       return value.connection === "unavailable" ? value : null;
-    }, "validated unavailable handshake rendered in packaged app");
-    assertUnavailable(unavailable);
+    }, "native core readiness rendered with generation unavailable");
+    assertGenerationUnconfigured(unavailable);
+    await execute(`const input = document.querySelector('#composer-input');
+      input.value = 'Bootstrap unavailable-generation check';
+      input.dispatchEvent(new Event('input', {bubbles:true}));`);
+    assertGenerationUnconfigured(await state());
     assert(
       [
         "http://tauri.localhost",
@@ -346,11 +606,11 @@ export async function runSmoke() {
     report.checks.push({ unavailable });
     await screenshot("unavailable");
     const denied = await request("POST", `/session/${session}/execute/async`, {
-      script: `const done = arguments[arguments.length-1]; window.__TAURI_INTERNALS__.invoke('dialog_select_workspace').then(() => done({allowed:true}), error => done({allowed:false,code:error.code}));`,
+      script: `const done = arguments[arguments.length-1]; window.__TAURI_INTERNALS__.invoke('send', {op:'session.start',payload:{protocolVersion:0}}).then(() => done({allowed:true}), error => done({allowed:false,code:error.code}));`,
       args: [],
     });
     assert.deepEqual(denied, { allowed: false, code: "POLICY_DENIED" });
-    assertUnavailable(await state());
+    assertGenerationUnconfigured(await state());
     report.checks.push({ nativeDenied: denied });
     const current = processes().find((candidate) =>
       sameProcess(candidate, engine),
@@ -367,6 +627,7 @@ export async function runSmoke() {
       return value.connection === "disconnected" ? value : null;
     }, "real engine exit changes renderer state to disconnected");
     assert.equal(disconnected.ready, false);
+    assert.equal(disconnected.sendDisabled, true);
     assert.match(disconnected.text, /Engine stopped/i);
     report.checks.push({ disconnected });
     await screenshot("disconnected");
@@ -384,6 +645,88 @@ export async function runSmoke() {
     report.passed = true;
   } catch (error) {
     report.error = error.stack;
+    report.failedRequest = report.lastRequest;
+    if (sessionRequestStartedAt && !session)
+      report.sessionRequestElapsedMs = Date.now() - sessionRequestStartedAt;
+    console.error("Failed at WebDriver request:", report.failedRequest);
+    try {
+      const snapshot = processes();
+      const owned = snapshot.filter(
+        (candidate) => child?.pid && ownedBy(candidate, child.pid, snapshot),
+      );
+      const applications = owned.filter(
+        (candidate) =>
+          candidate.ExecutablePath?.toLowerCase() === app.toLowerCase(),
+      );
+      report.failureProcesses = {
+        driverAlive: child?.exitCode === null,
+        nativeDriverStarted: owned.some(
+          (candidate) =>
+            candidate.ExecutablePath?.toLowerCase() === edge.toLowerCase(),
+        ),
+        applicationStarted: applications.length > 0,
+        applicationWindowStarted: applications.some(
+          (candidate) =>
+            Number(
+              powershell(
+                `(Get-Process -Id ${candidate.ProcessId} -ErrorAction Stop).MainWindowHandle`,
+              ),
+            ) > 0,
+        ),
+        webviewStarted: owned.some((candidate) =>
+          webViewVersionFromProcess(candidate),
+        ),
+        engineStarted: owned.some((candidate) =>
+          candidate.ExecutablePath?.toLowerCase().endsWith(
+            "\\engine\\node.exe",
+          ),
+        ),
+      };
+      console.error("Owned process state:", report.failureProcesses);
+      // Pinned tauri-driver discards native stdout; native stderr inherits our log pipe.
+      report.nativeDriverStdout = "suppressed by tauri-driver 2.1.0";
+      report.applicationElevation = applications.map(processElevation);
+      report.webviewDebugging = await webviewDebuggingState(owned);
+      console.error("Owned WebView debugging state:", report.webviewDebugging);
+      const profile = process.env.USERPROFILE;
+      report.runnerProfile = {
+        configured: Boolean(profile),
+        exists:
+          Boolean(profile) &&
+          (await access(profile, constants.F_OK).then(
+            () => true,
+            () => false,
+          )),
+        writeAccessCheck:
+          Boolean(profile) &&
+          (await access(profile, constants.W_OK).then(
+            () => true,
+            () => false,
+          )),
+        webviewFolderOverride: Boolean(process.env.WEBVIEW2_USER_DATA_FOLDER),
+      };
+      if (
+        !session &&
+        report.failedRequest?.path === "/session" &&
+        child?.exitCode === null
+      ) {
+        // A later session is diagnostic only; the original smoke error is always rethrown.
+        try {
+          const sessions = await request("GET", "/sessions");
+          report.nativeSessionObservation = {
+            elapsedSinceSessionStartMs: Date.now() - sessionRequestStartedAt,
+            sessionCount: Array.isArray(sessions) ? sessions.length : null,
+          };
+        } catch (observationError) {
+          report.nativeSessionObservation = {
+            elapsedSinceSessionStartMs: Date.now() - sessionRequestStartedAt,
+            error: observationError.name,
+          };
+        }
+      }
+    } catch (inspectionError) {
+      report.failureProcessInspection = String(inspectionError);
+    }
     if (session) {
       try {
         await screenshot("failure");
@@ -428,9 +771,24 @@ export async function runSmoke() {
       process.exitCode = 1;
     }
     logs.end();
+    await finished(logs);
     await writeFile(
       resolve(artifacts, "result.json"),
       JSON.stringify(report, null, 2),
+    );
+    const diagnostics = sanitizeSmokeDiagnostics(
+      report,
+      await readFile(resolve(artifacts, "driver.log"), "utf8"),
+    );
+    const diagnosticDirectory = resolve(artifacts, "diagnostics");
+    await mkdir(diagnosticDirectory, { recursive: true });
+    await writeFile(
+      resolve(diagnosticDirectory, "result.json"),
+      diagnostics.result,
+    );
+    await writeFile(
+      resolve(diagnosticDirectory, "driver.log"),
+      diagnostics.driverLog,
     );
     console.log(
       `${report.passed ? "PASS" : "FAIL"} ${report.case}: ${artifacts}`,
@@ -443,7 +801,7 @@ if (
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
   runSmoke().catch((error) => {
-    console.error(error.message);
+    console.error(error.stack);
     process.exitCode = 1;
   });
 }

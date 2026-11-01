@@ -12,6 +12,15 @@ import type {
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions.js";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
+import {
+	assertCredentialApiIdentity,
+	assertCredentialOptions,
+	createLeasedFetch,
+	redactEventWithLease,
+	redactResponseWithLease,
+	redactWithLease,
+	type SplyceCredentials,
+} from "../splyce-credentials.ts";
 import type {
 	AssistantMessage,
 	CacheRetention,
@@ -337,6 +346,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 		// `reasoning_details` are replay metadata, not user-visible stream deltas.
 		// Keep them in memory during streaming and serialize once when the block is finalized.
 		let streamedReasoningDetails: OpenAIReasoningDetail[] | undefined;
+		let credentials: SplyceCredentials | undefined;
 		const applyStreamedReasoningDetails = (block: ThinkingContent): void => {
 			if (streamedReasoningDetails !== undefined) {
 				block.thinkingSignature = JSON.stringify(streamedReasoningDetails);
@@ -344,7 +354,15 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 		};
 
 		try {
-			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
+			assertCredentialOptions(options ?? {}, model.headers);
+			assertCredentialApiIdentity(model.api, "openai-completions", options);
+			credentials = options?.credentials;
+			const apiKey = credentials
+				? "splyce-leased"
+				: getClientApiKey(model.provider, options?.apiKey, options?.headers);
+			const fetch = credentials
+				? createLeasedFetch(credentials, "authorization", options?.fetch, (secret) => `Bearer ${secret}`)
+				: options?.fetch;
 			const compat = getCompat(model);
 			const grammarToolInputProperties = createGrammarToolInputProperties(
 				getDeclaredTools(normalizedContext.messages),
@@ -358,7 +376,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				apiKey,
 				options?.headers,
 				options?.identity,
-				options?.fetch,
+				fetch,
 				cacheSessionId,
 				compat,
 			);
@@ -387,7 +405,13 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					signal: options?.signal,
 				},
 			);
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			await options?.onResponse?.(
+				await redactResponseWithLease(credentials, {
+					status: response.status,
+					headers: headersToRecord(response.headers),
+				}),
+				model,
+			);
 			stream.push({ type: "start", partial: output });
 
 			// Stream state of a tool call, kept off the content block so it never reaches partials: JSON arguments, or
@@ -540,7 +564,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			};
 
 			for await (const chunk of openaiStream) {
-				await options?.onProviderStreamEvent?.(chunk, model);
+				const observe = options?.onProviderStreamEvent;
+				if (observe) await observe(await redactEventWithLease(credentials, chunk), model);
 				if (!chunk || typeof chunk !== "object") continue;
 
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
@@ -692,21 +717,25 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			// Failed or cancelled output must not expose executable tool calls.
+			output.content = output.content.filter((block) => block.type !== "toolCall");
 			for (const block of output.content) {
 				if (block.type === "thinking") {
 					applyStreamedReasoningDetails(block);
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			delete output.errorMessage;
+			let errorMessage = formatProviderError(normalizeProviderError(error));
 			// Some providers via OpenRouter give additional information in this field.
 			// normalizeProviderError already stringifies the parsed body (error.error)
 			// into errorMessage, so only append the raw metadata when it is not already
 			// present to avoid double-printing it.
 			const rawMetadata = (error as any)?.error?.metadata?.raw;
-			if (rawMetadata && !output.errorMessage.includes(String(rawMetadata))) {
-				output.errorMessage += `\n${rawMetadata}`;
+			if (rawMetadata && !errorMessage.includes(String(rawMetadata))) {
+				errorMessage += `\n${rawMetadata}`;
 			}
+			output.errorMessage = await redactWithLease(credentials, errorMessage);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -720,7 +749,7 @@ export const streamSimple: StreamFunction<"openai-completions", SimpleStreamOpti
 	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
-	getClientApiKey(model.provider, options?.apiKey, options?.headers);
+	if (!options?.credentials) getClientApiKey(model.provider, options?.apiKey, options?.headers);
 
 	const base = {
 		...buildBaseOptions(model, context, options, options?.apiKey),
@@ -775,6 +804,8 @@ function createClient(
 
 	return new OpenAI({
 		apiKey,
+		// Injected transports own diagnostics and account metadata; do not add ambient SDK values.
+		...(fetch ? { logLevel: "off" as const, organization: null, project: null } : {}),
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,

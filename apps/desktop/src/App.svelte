@@ -1,19 +1,36 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import type { Handshake, SplyceEvent } from "@splyce/pi/contracts";
+  import type {
+    Handshake,
+    PortAvailability,
+    SplyceEvent,
+  } from "@splyce/pi/contracts";
   import Composer from "./components/Composer.svelte";
   import SessionTree from "./components/SessionTree.svelte";
+  import SessionActions from "./components/SessionActions.svelte";
   import TurnStream from "./components/TurnStream.svelte";
   import Shell from "./components/shell/Shell.svelte";
   import UsageView from "./components/usage/UsageView.svelte";
+  import ApprovalSurface from "./components/ApprovalSurface.svelte";
+  import PermissionModeSelect from "./components/PermissionModeSelect.svelte";
+  import SupportStatus from "./components/SupportStatus.svelte";
   import Providers from "./routes/Providers.svelte";
   import Setup from "./routes/Setup.svelte";
   import Modules from "./routes/Modules.svelte";
   import { unavailableModuleSnapshot } from "./stores/modules";
+  import type {
+    ApprovalContext,
+    ApprovalRequestView,
+  } from "./stores/approvals";
+  import {
+    initialPermissionMode,
+    type PermissionModeContext,
+  } from "./stores/permission-mode";
   import {
     connectionState,
     handshake,
     onEvent,
+    portAvailability,
     subscribe,
     type EngineConnectionState,
   } from "./stores/engine";
@@ -32,6 +49,7 @@
     type SessionNavState,
     type TreeEventLike,
   } from "./stores/sessions";
+  import type { SessionActionsContext } from "./stores/session-actions";
   import {
     createTurnStreamTransport,
     createTurnsState,
@@ -53,6 +71,36 @@
     "No setup or module service is connected.",
   );
 
+  // TD-30: the turns store carries tool-call approvals for the inline
+  // ApprovalCard, but no request carries the config/profile/policy revisions it
+  // was issued against, and the dialog must not ask about a target it cannot
+  // verify. The surface therefore shows only requests with a known revision:
+  // there are none today, so the shell never claims an approval is pending.
+  const approvalRequests: readonly ApprovalRequestView[] = [];
+  const approvalContext: ApprovalContext = {
+    engine: "unavailable",
+    engineReason: "Session revisions are not delivered to the renderer yet.",
+    sessionId: null,
+    scopeId: null,
+    runId: null,
+    actionId: null,
+    targetScope: null,
+    normalizedTarget: null,
+    revision: null,
+    runCanceled: false,
+    nowMs: 0,
+  };
+
+  // TD-30 Supervisor: a mode change is engine-admitted, and without the session
+  // revisions it cannot be admitted at all. The selector is visibly disabled
+  // with that reason instead of pretending a selection could take effect.
+  const permissionContext: PermissionModeContext = {
+    engine: "unavailable",
+    engineReason: "Session revisions are not delivered to the renderer yet",
+    configRevision: null,
+    policyRevision: null,
+  };
+
   // Snapshot seam: the only thing allowed to complete a session load. Readiness proves nothing about sessions.
   let {
     loadSessions,
@@ -68,6 +116,12 @@
 
   let status = $state<EngineConnectionState>("disconnected");
   let readiness = $state<Handshake["readiness"] | null>(null);
+  let ports = $state<PortAvailability | null>(null);
+  let generationReady = $derived(
+    ports === null
+      ? undefined
+      : ports.generation && ports.provider && ports.workspace,
+  );
   let engineConnected = $state(false);
   let stopped = $derived(engineConnected && status === "disconnected");
   let mounted = false;
@@ -77,6 +131,45 @@
   let currentRun = $derived(
     turns.currentRunId ? turns.runs[turns.currentRunId] : undefined,
   );
+  // A different session starts on the safe mode: no mode or pending request
+  // carries over from the previous one.
+  const permissionModeState = $derived(
+    initialPermissionMode($selectedSession?.sessionId ?? null),
+  );
+
+  // TD-33: the actions target the branch the tree actually selected. The engine
+  // still does not deliver the revisions a lifecycle request needs, and a
+  // rewind/code restore is not admitted yet, so every action is visibly disabled
+  // with its own reason instead of pretending to run.
+  const sessionActionContext: SessionActionsContext = $derived.by(() => {
+    const key = nav.selectedKey;
+    const node =
+      key === null ? undefined : visibleNodes(nav).find((n) => n.key === key);
+    return {
+      engine: {
+        status: "unavailable",
+        reason: "Session revisions are not delivered to the renderer yet.",
+      },
+      rewind: {
+        status: "unavailable",
+        reason:
+          "A rewind request is not admitted yet: TD-25 restore receipts are not wired.",
+      },
+      codeRestore: {
+        status: "unavailable",
+        reason:
+          "Code restore is not available yet: TD-25 restore receipts are not wired.",
+      },
+      selected: node
+        ? {
+            sessionId: node.sessionId,
+            branchAnchorId: node.branchAnchorId,
+            leaves: node.leaves,
+          }
+        : null,
+      draft: "",
+    };
+  });
 
   function applyTree(event: SplyceEvent) {
     if (event.kind !== "session.tree_updated") return;
@@ -149,7 +242,13 @@
     const binding = bindSelection(transport, subscribe);
     const unsubState = connectionState.subscribe((val) => {
       status = val;
-      if (val === "disconnected") readiness = null;
+      if (val === "disconnected") {
+        readiness = null;
+        ports = null;
+      }
+    });
+    const unsubPorts = portAvailability.subscribe((val) => {
+      ports = val;
     });
     const unsubBinding = binding.status.subscribe((next) => {
       subscription = next;
@@ -165,6 +264,7 @@
     return () => {
       mounted = false;
       unsubState();
+      unsubPorts();
       unsubEvents();
       unsubBinding();
       binding.dispose();
@@ -180,6 +280,7 @@
   data-readiness-policy={readiness ? readiness.policy : "unknown"}
   data-readiness-store={readiness ? readiness.store : "unknown"}
   data-readiness-receipts={readiness ? readiness.receipts : "unknown"}
+  data-readiness-generation={ports ? ports.generation : "unknown"}
 >
   <Shell {rail} {transcript} {composer} {evidence} />
 </div>
@@ -191,7 +292,7 @@
       {stopped ? "engine stopped" : status}
     </span>
   </div>
-  <nav aria-label="Views">
+  <nav class="views-nav" aria-label="Views">
     {#each VIEWS as [id, label] (id)}
       <button type="button" aria-current={view === id ? "page" : undefined} onclick={() => (view = id)}>
         {label}
@@ -201,16 +302,23 @@
   <SessionTree
     {nav}
     {onSelect}
+    canRetry={status === "ready"}
     onFocus={(key) => dispatchNav({ type: "focus", key })}
     onMove={(to) => dispatchNav({ type: "move", to })}
     onRetry={() => {
       if (status === "ready" && loadSessions) void runLoad();
-      else void connect();
     }}
   />
+  <SessionActions context={sessionActionContext} />
+  <section class="supervisor" aria-label="Supervisor" data-testid="supervisor">
+    <h2>Supervisor</h2>
+    <PermissionModeSelect modeState={permissionModeState} context={permissionContext} />
+  </section>
 {/snippet}
 
 {#snippet transcript()}
+  <!-- TD-30: engine-facing approval mount. Empty until requests carry revisions. -->
+  <ApprovalSurface requests={approvalRequests} context={approvalContext} />
   {#if subscription.state === "failed"}
     <div class="subscribe-error" role="alert" data-testid="subscribe-error">
       <span>Could not subscribe to the session: {subscription.error}</span>
@@ -223,6 +331,7 @@
       <Providers connections={[]} families={[]} onAddCustom={() => {}} />
       <p role="status">Provider connections are unavailable: no profile service is connected.</p>
     </fieldset>
+    <SupportStatus cells={null} />
   {:else if view === "setup"}
     <Setup
       snapshot={moduleSnapshot}
@@ -236,18 +345,22 @@
       onConfigureProvider={() => (view = "providers")}
     />
   {:else if view === "usage"}
-    <UsageView usage={null} />
-    <p role="status" data-testid="usage-unavailable-note">Usage unavailable - no engine usage report.</p>
+    <UsageView usage={null} status="unavailable" />
   {:else}
     <div class="app-content" class:conversation={currentRun !== undefined}>
       {#if status !== "ready"}
         <div class="unavailable-view" data-testid="unavailable-banner" role="status" aria-live="polite">
-          <h2>{stopped ? "Engine stopped" : "Engine Unavailable"}</h2>
+          <h2>{stopped ? "Engine stopped" : readiness?.state === "ready" ? "Generation unconfigured" : "Engine Unavailable"}</h2>
           <p>
             {stopped
-              ? "The native engine exited. Restart the app to reconnect; the last transcript may be incomplete."
+              ? "The native engine exited. Reconnect to resume or restart the app; the last transcript may be incomplete."
+              : readiness?.state === "ready"
+                ? "Generation requires a configured provider and workspace."
               : "Backend native services (policy, durable store, and receipts) are currently initializing or unavailable. Release qualification requires all three subsystems verified before task execution."}
           </p>
+          {#if stopped || status === "unavailable" || status === "error"}
+            <button type="button" class="retry-btn" onclick={() => void connect()}>Retry</button>
+          {/if}
         </div>
       {/if}
       {#if currentRun}
@@ -270,10 +383,13 @@
 {/snippet}
 
 {#snippet composer()}
-  <!-- stale: config/profile/policy revisions are not delivered to the renderer yet, so sending is disabled. -->
+  <!-- stale: config/profile/policy revisions are not delivered to the renderer yet, so
+       sending is disabled. generationReady is derived from portAvailability; fail closed
+       when false or unreported. -->
   <Composer
     connection={status}
     sessionId={$selectedSession?.sessionId ?? null}
+    {generationReady}
     unavailable="Sending is not available yet"
     send={async () => {
       throw new Error("Sending is unavailable: session revisions are not wired.");
@@ -297,12 +413,41 @@
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 12px;
+    padding: 12px 16px;
   }
   .brand h1 {
     font-size: 1.125rem;
     margin: 0;
     font-weight: 700;
+  }
+  .views-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 0 12px 12px 12px;
+    border-bottom: 1px solid #e5e7eb;
+  }
+  .views-nav button {
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: #4b5563;
+    background: transparent;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .views-nav button:hover {
+    background: #f3f4f6;
+    color: #111827;
+  }
+  .views-nav button[aria-current="page"] {
+    background: #ffffff;
+    color: #111827;
+    font-weight: 600;
+    border-color: #d1d5db;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
   }
   .status-badge {
     padding: 2px 8px;
@@ -323,6 +468,21 @@
   }
   [aria-current="page"] {
     font-weight: 700;
+  }
+  .supervisor {
+    display: grid;
+    gap: 8px;
+    padding: 12px;
+    border-top: 1px solid #e5e7eb;
+    margin-top: 8px;
+  }
+  .supervisor h2 {
+    margin: 0;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #4b5563;
   }
   fieldset {
     border: 0;
@@ -374,5 +534,20 @@
     color: #4b5563;
     font-size: 0.875rem;
     line-height: 1.5;
+    margin-bottom: 20px;
+  }
+  .retry-btn {
+    padding: 8px 20px;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: #ffffff;
+    background: #111827;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .retry-btn:hover {
+    background: #374151;
   }
 </style>

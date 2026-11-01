@@ -19,7 +19,14 @@ import {
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
 import { requireSplyceToolAdmission } from "./splyce-admission.ts";
-import { assertSplyceReady } from "./splyce-readiness.ts";
+import {
+	assertSameSplyceOwner,
+	assertSplyceLoopStream,
+	assertSplyceReady,
+	assertSplyceToolCurrent,
+	getSplyceToolImplementation,
+	inheritSplyceLoopConfig,
+} from "./splyce-readiness.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AgentContext,
@@ -53,7 +60,10 @@ export function agentLoop(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
-	assertSplyceReady();
+	assertSplyceReady(config);
+	assertSameSplyceOwner(config, config, "loop-config");
+	assertSplyceLoopStream(config, streamFn);
+	signal?.throwIfAborted();
 	const stream = createAgentStream();
 
 	void runAgentLoop(
@@ -65,9 +75,12 @@ export function agentLoop(
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	).then(
+		(messages) => {
+			stream.end(messages);
+		},
+		(error) => stream.fail(error),
+	);
 
 	return stream;
 }
@@ -86,7 +99,10 @@ export function agentLoopContinue(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
-	assertSplyceReady();
+	assertSplyceReady(config);
+	assertSameSplyceOwner(config, config, "loop-config");
+	assertSplyceLoopStream(config, streamFn);
+	signal?.throwIfAborted();
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
 	}
@@ -105,9 +121,12 @@ export function agentLoopContinue(
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	).then(
+		(messages) => {
+			stream.end(messages);
+		},
+		(error) => stream.fail(error),
+	);
 
 	return stream;
 }
@@ -120,7 +139,18 @@ export async function runAgentLoop(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): Promise<AgentMessage[]> {
-	assertSplyceReady();
+	assertSplyceReady(config);
+	assertSameSplyceOwner(config, config, "loop-config");
+	assertSplyceLoopStream(config, streamFn);
+	signal?.throwIfAborted();
+	const nativeEmit = emit;
+	emit = async (event) => {
+		assertSplyceReady(config);
+		signal?.throwIfAborted();
+		await nativeEmit(event);
+		assertSplyceReady(config);
+		signal?.throwIfAborted();
+	};
 	const initialMessages = declareToolChanges(context, prompts);
 	const newMessages: AgentMessage[] = [...initialMessages];
 	const currentContext: AgentContext = {
@@ -146,7 +176,18 @@ export async function runAgentLoopContinue(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): Promise<AgentMessage[]> {
-	assertSplyceReady();
+	assertSplyceReady(config);
+	assertSameSplyceOwner(config, config, "loop-config");
+	assertSplyceLoopStream(config, streamFn);
+	signal?.throwIfAborted();
+	const nativeEmit = emit;
+	emit = async (event) => {
+		assertSplyceReady(config);
+		signal?.throwIfAborted();
+		await nativeEmit(event);
+		assertSplyceReady(config);
+		signal?.throwIfAborted();
+	};
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
 	}
@@ -165,8 +206,28 @@ export async function runAgentLoopContinue(
 	return newMessages;
 }
 
-function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
-	return new EventStream<AgentEvent, AgentMessage[]>(
+class AgentEventStream extends EventStream<AgentEvent, AgentMessage[]> {
+	private failure?: unknown;
+	private failed = false;
+	fail(error: unknown): void {
+		this.failure = error;
+		this.failed = true;
+		this.end([]);
+	}
+	override async result(): Promise<AgentMessage[]> {
+		const result = await super.result();
+		if (this.failed) throw this.failure;
+		return result;
+	}
+	override async *[Symbol.asyncIterator](): AsyncIterator<AgentEvent> {
+		const iterator = super[Symbol.asyncIterator]();
+		yield* { [Symbol.asyncIterator]: () => iterator };
+		if (this.failed) throw this.failure;
+	}
+}
+
+function createAgentStream(): AgentEventStream {
+	return new AgentEventStream(
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
@@ -196,10 +257,15 @@ async function runLoop(
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			assertSplyceReady(config);
+			signal?.throwIfAborted();
 			let preparedMessages: AgentMessage[] = [];
 			if (lastCompletedTurn) {
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
+				assertSplyceReady(config);
+				signal?.throwIfAborted();
 				if (nextTurnSnapshot) {
+					const previousConfig = config;
 					currentContext = nextTurnSnapshot.context ?? currentContext;
 					preparedMessages = nextTurnSnapshot.messages ?? [];
 					config = {
@@ -212,6 +278,7 @@ async function runLoop(
 									? undefined
 									: nextTurnSnapshot.thinkingLevel,
 					};
+					inheritSplyceLoopConfig(previousConfig, config);
 				}
 				// Preparation can be long-running (for example, compaction). Pick up steering
 				// queued while it ran. Only poll again if the earlier poll returned nothing;
@@ -239,7 +306,10 @@ async function runLoop(
 				},
 				signal,
 			);
+			assertSplyceReady(config);
+			signal?.throwIfAborted();
 			if (requestUpdate) {
+				const previousConfig = config;
 				currentContext = requestUpdate.context ?? currentContext;
 				config = {
 					...config,
@@ -251,6 +321,7 @@ async function runLoop(
 								? undefined
 								: requestUpdate.thinkingLevel,
 				};
+				inheritSplyceLoopConfig(previousConfig, config);
 			}
 
 			// Stream assistant response
@@ -299,6 +370,8 @@ async function runLoop(
 				newMessages,
 			};
 			const decision = await config.finishTurn?.(lastCompletedTurn, signal);
+			assertSplyceReady(config);
+			signal?.throwIfAborted();
 			await emit({ type: "turn_end", message, toolResults });
 
 			if (decision?.action === "end") {
@@ -315,6 +388,8 @@ async function runLoop(
 
 		// Agent would stop here. Check for follow-up messages.
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+		assertSplyceReady(config);
+		signal?.throwIfAborted();
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
 			explicitContinuation = false;
@@ -401,13 +476,19 @@ async function streamAssistantResponse(
 	streamFunction: StreamFn,
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
+	assertSplyceReady(config);
+	signal?.throwIfAborted();
 	let messages = context.messages;
 	if (config.transformContext) {
 		messages = await config.transformContext(messages, signal);
+		assertSplyceReady(config);
+		signal?.throwIfAborted();
 	}
 
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
 	const llmMessages = await config.convertToLlm(messages);
+	assertSplyceReady(config);
+	signal?.throwIfAborted();
 
 	const llmContext = normalizeContext({ messages: llmMessages });
 
@@ -415,6 +496,9 @@ async function streamAssistantResponse(
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
 
+	assertSplyceReady(config);
+	assertSplyceLoopStream(config, streamFunction);
+	signal?.throwIfAborted();
 	const response = await streamFunction(config.model, llmContext, {
 		...config,
 		apiKey: resolvedApiKey,
@@ -428,6 +512,8 @@ async function streamAssistantResponse(
 	let addedPartial = false;
 
 	for await (const event of response) {
+		assertSplyceReady(config);
+		signal?.throwIfAborted();
 		switch (event.type) {
 			case "start":
 				partialMessage = event.partial;
@@ -459,6 +545,8 @@ async function streamAssistantResponse(
 			case "done":
 			case "error": {
 				const finalMessage = await result();
+				assertSplyceReady(config);
+				signal?.throwIfAborted();
 				if (addedPartial) {
 					context.messages[context.messages.length - 1] = finalMessage;
 				} else {
@@ -474,6 +562,8 @@ async function streamAssistantResponse(
 	}
 
 	const finalMessage = await result();
+	assertSplyceReady(config);
+	signal?.throwIfAborted();
 	if (addedPartial) {
 		context.messages[context.messages.length - 1] = finalMessage;
 	} else {
@@ -528,6 +618,9 @@ async function executeToolCalls(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
+	assertSplyceReady(config);
+	signal?.throwIfAborted();
+	for (const tool of currentContext.tools ?? []) assertSameSplyceOwner(config, tool, "tool");
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
@@ -731,6 +824,7 @@ async function prepareToolCall(
 	parentToolCallId?: string,
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
 	const tool = tools.find((t) => t.name === toolCall.name);
+	if (tool) assertSplyceToolCurrent(tool);
 	requireSplyceToolAdmission(tool).reserve(toolCall.id, toolCall.name, signal);
 	if (!tool) {
 		return {
@@ -740,6 +834,7 @@ async function prepareToolCall(
 		};
 	}
 
+	assertSplyceToolCurrent(tool, signal);
 	let validatedArgs: unknown;
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
@@ -753,13 +848,20 @@ async function prepareToolCall(
 		};
 	}
 	try {
-		await requireSplyceToolAdmission(tool).prepare(toolCall.id, toolCall.name, validatedArgs, parentToolCallId, signal);
+		await requireSplyceToolAdmission(tool).prepare(
+			toolCall.id,
+			toolCall.name,
+			validatedArgs,
+			parentToolCallId,
+			signal,
+		);
 	} catch (error) {
 		requireSplyceToolAdmission(tool).discard(toolCall.id, signal?.aborted ? "canceled" : "denied");
 		throw error;
 	}
 	let hooksCompleted = false;
 	try {
+		assertSplyceToolCurrent(tool, signal);
 		if (signal?.aborted) {
 			return {
 				kind: "immediate",
@@ -811,7 +913,8 @@ async function prepareToolCall(
 			isError: true,
 		};
 	} finally {
-		if (!hooksCompleted) requireSplyceToolAdmission(tool).discard(toolCall.id, signal?.aborted ? "canceled" : "denied");
+		if (!hooksCompleted)
+			requireSplyceToolAdmission(tool).discard(toolCall.id, signal?.aborted ? "canceled" : "denied");
 	}
 	requireSplyceToolAdmission(tool).finish(toolCall.id, toolCall.name, validatedArgs, signal);
 	return {
@@ -889,13 +992,20 @@ async function executePreparedToolCall(
 			const elapsed = () => Math.round(performance.now() - startedAt);
 
 			try {
-				const result = await prepared.tool.execute(
+				signal?.throwIfAborted();
+				const result = await getSplyceToolImplementation(prepared.tool).call(
+					prepared.tool,
 					prepared.toolCall.id,
 					admittedArgs as never,
 					signal,
 					(partialResult) => {
 						if (!acceptingUpdates) return;
-						updateEvents.push(Promise.resolve(onUpdate(partialResult)));
+						assertSplyceToolCurrent(prepared.tool, signal);
+						updateEvents.push(
+							Promise.resolve(onUpdate(partialResult)).then(() => {
+								assertSplyceToolCurrent(prepared.tool, signal);
+							}),
+						);
 					},
 				);
 				const durationMs = elapsed();
@@ -931,6 +1041,7 @@ async function finalizeExecutedToolCall(
 	let isError = executed.isError;
 
 	if (config.afterToolCall) {
+		assertSplyceToolCurrent(prepared.tool, signal);
 		try {
 			const afterResult = await config.afterToolCall(
 				{
@@ -943,6 +1054,7 @@ async function finalizeExecutedToolCall(
 				},
 				signal,
 			);
+			assertSplyceToolCurrent(prepared.tool, signal);
 			if (afterResult) {
 				// Structured content not replaced along with the content may no longer match it.
 				const structuredContent =

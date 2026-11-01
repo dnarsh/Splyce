@@ -25,10 +25,11 @@ function render(
   entries: MemoryEntry[],
   onForget = vi.fn(async () => {}),
   status: MemoryStatus = "on",
+  stale = false,
 ) {
   cmp = mount(MemoryList, {
     target: document.body,
-    props: { entries, onForget, status },
+    props: { entries, onForget, status, stale },
   });
   flushSync();
   return onForget;
@@ -70,6 +71,74 @@ describe("MemoryList", () => {
     expect(
       document.querySelectorAll('[data-testid="memory-item"]').length,
     ).toBe(0);
+  });
+
+  it("before the first snapshot it says loading, not that nothing is remembered", () => {
+    render([], undefined, "loading");
+
+    expect(q('[data-testid="memory-loading"]')!.textContent).toContain(
+      "Loading remembered items",
+    );
+    expect(q('[data-testid="memory-list"]')!.getAttribute("aria-busy")).toBe(
+      "true",
+    );
+    // An unloaded list is not an empty one.
+    expect(q('[data-testid="memory-empty"]')).toBeNull();
+    expect(document.body.textContent).not.toContain(
+      "Nothing is remembered yet",
+    );
+    expect(
+      document.querySelectorAll('[data-testid="memory-item"]').length,
+    ).toBe(0);
+  });
+
+  it("a refresh keeps the known items visible while it is loading", () => {
+    render([entry("m1")], undefined, "loading");
+
+    expect(q('[data-testid="memory-loading"]')).not.toBeNull();
+    expect(
+      document.querySelectorAll('[data-testid="memory-item"]').length,
+    ).toBe(1);
+    expect(q('[data-testid="memory-empty"]')).toBeNull();
+  });
+
+  it("a failed load is an alert, not an empty memory", () => {
+    render([], undefined, "error");
+
+    const alert = q('[data-testid="memory-error"]')!;
+    expect(alert.getAttribute("role")).toBe("alert");
+    expect(alert.textContent).toContain("could not be loaded");
+    expect(q('[data-testid="memory-empty"]')).toBeNull();
+    expect(document.body.textContent).not.toContain(
+      "Nothing is remembered yet",
+    );
+    expect(
+      document.querySelectorAll('[data-testid="memory-item"]').length,
+    ).toBe(0);
+  });
+
+  it("a stale list says it may be out of date and still shows its items", () => {
+    render([entry("m1")], undefined, "on", true);
+
+    expect(q('[data-testid="memory-stale"]')!.textContent).toContain(
+      "out of date",
+    );
+    expect(
+      document.querySelectorAll('[data-testid="memory-item"]').length,
+    ).toBe(1);
+    unmount(cmp!);
+    document.body.innerHTML = "";
+    render([entry("m1")]);
+    expect(q('[data-testid="memory-stale"]')).toBeNull();
+  });
+
+  it("an empty stale list does not claim nothing is remembered", () => {
+    render([], undefined, "on", true);
+
+    const copy = q('[data-testid="memory-empty"]')!.textContent!;
+    expect(copy).toContain("out of date");
+    expect(copy).not.toContain("Nothing is remembered yet");
+    expect(q('[data-testid="memory-stale"]')).toBeNull();
   });
 
   it("forget requires confirmation and is not called by the first click", async () => {

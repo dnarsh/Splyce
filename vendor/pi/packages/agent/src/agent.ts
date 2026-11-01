@@ -13,7 +13,12 @@ import {
 	toToolDeclaration,
 } from "@earendil-works/pi-ai";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
-import { assertSplyceReady } from "./splyce-readiness.ts";
+import {
+	assertSplyceReady,
+	getSplyceAgentCallbacks,
+	inheritSplyceLoopConfig,
+	inheritSplyceOwner,
+} from "./splyce-readiness.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -261,6 +266,7 @@ export class Agent {
 		this.maxRetryDelayMs = runtimeOptions.maxRetryDelayMs;
 		this.toolExecution = runtimeOptions.toolExecution ?? "parallel";
 		this.identity = runtimeOptions.identity;
+		if (options) inheritSplyceOwner(options, this, "agent");
 	}
 
 	/**
@@ -381,7 +387,8 @@ export class Agent {
 	async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
 	async prompt(input: string, images?: ImageContent[]): Promise<void>;
 	async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
-		assertSplyceReady();
+		assertSplyceReady(this);
+		getSplyceAgentCallbacks(this);
 		if (this.activeRun) {
 			throw new Error(
 				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
@@ -393,7 +400,8 @@ export class Agent {
 
 	/** Continue from the current transcript. The last message must be a user or tool-result message. */
 	async continue(): Promise<void> {
-		assertSplyceReady();
+		assertSplyceReady(this);
+		getSplyceAgentCallbacks(this);
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
@@ -478,34 +486,52 @@ export class Agent {
 
 	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
-		return {
+		const callbacks = getSplyceAgentCallbacks(this);
+		const check = () => {
+			getSplyceAgentCallbacks(this);
+			this.signal?.throwIfAborted();
+		};
+		const guard = <T extends (...args: any[]) => any>(callback: T | undefined): T | undefined =>
+			callback &&
+			(((...args: Parameters<T>) => {
+				check();
+				const result = callback(...args);
+				if (result && typeof result.then === "function")
+					return Promise.resolve(result).then((value) => {
+						check();
+						return value;
+					});
+				check();
+				return result;
+			}) as T);
+		const config: AgentLoopConfig = {
 			model: this._state.model,
 			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
 			sessionId: this.sessionId,
-			onPayload: this.onPayload,
-			onResponse: this.onResponse,
-			onProviderStreamEvent: this.onProviderStreamEvent,
+			onPayload: guard(callbacks.onPayload),
+			onResponse: guard(callbacks.onResponse),
+			onProviderStreamEvent: guard(callbacks.onProviderStreamEvent),
 			transport: this.transport,
 			thinkingBudgets: this.thinkingBudgets,
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			identity: this.identity,
 			toolExecution: this.toolExecution,
-			beforeToolCall: this.beforeToolCall,
-			afterToolCall: this.afterToolCall,
-			finishTurn: this.finishTurn,
-			prepareRequest: this.prepareRequest,
+			beforeToolCall: guard(callbacks.beforeToolCall),
+			afterToolCall: guard(callbacks.afterToolCall),
+			finishTurn: guard(callbacks.finishTurn),
+			prepareRequest: guard(callbacks.prepareRequest),
 			prepareNextTurn:
-				this.prepareNextTurnWithContext || this.prepareNextTurn
+				callbacks.prepareNextTurnWithContext || callbacks.prepareNextTurn
 					? async (context) => {
-							if (this.prepareNextTurnWithContext) {
-								return await this.prepareNextTurnWithContext(context, this.signal);
+							if (callbacks.prepareNextTurnWithContext) {
+								return await guard(callbacks.prepareNextTurnWithContext)!(context, this.signal);
 							}
-							return await this.prepareNextTurn?.(this.signal);
+							return await guard(callbacks.prepareNextTurn)?.(this.signal);
 						}
 					: undefined,
-			convertToLlm: this.convertToLlm,
-			transformContext: this.transformContext,
-			getApiKey: this.getApiKey,
+			convertToLlm: guard(callbacks.convertToLlm)!,
+			transformContext: guard(callbacks.transformContext),
+			getApiKey: guard(callbacks.getApiKey),
 			getSteeringMessages: async () => {
 				if (skipInitialSteeringPoll) {
 					skipInitialSteeringPoll = false;
@@ -515,6 +541,8 @@ export class Agent {
 			},
 			getFollowUpMessages: async () => this.followUpQueue.drain(),
 		};
+		inheritSplyceLoopConfig(this, config);
+		return config;
 	}
 
 	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
@@ -543,6 +571,14 @@ export class Agent {
 	}
 
 	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
+		this._state.errorMessage = error instanceof Error ? error.message : String(error);
+		if (aborted) return;
+		try {
+			getSplyceAgentCallbacks(this);
+		} catch (readinessError) {
+			if ((readinessError as { code?: string }).code === "SPLYCE_UNAVAILABLE") return;
+			throw readinessError;
+		}
 		const failureMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "" }],
@@ -576,6 +612,8 @@ export class Agent {
 	 * and `finishRun()` clears runtime-owned state.
 	 */
 	private async processEvents(event: AgentEvent): Promise<void> {
+		getSplyceAgentCallbacks(this);
+		this.signal?.throwIfAborted();
 		switch (event.type) {
 			case "message_start":
 				this._state.streamingMessage = event.message;
@@ -620,7 +658,11 @@ export class Agent {
 			throw new Error("Agent listener invoked outside active run");
 		}
 		for (const listener of this.listeners) {
+			getSplyceAgentCallbacks(this);
+			signal.throwIfAborted();
 			await listener(event, signal);
+			getSplyceAgentCallbacks(this);
+			signal.throwIfAborted();
 		}
 	}
 }

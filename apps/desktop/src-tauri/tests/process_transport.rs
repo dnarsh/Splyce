@@ -1,5 +1,13 @@
 #![cfg(windows)]
 
+#[path = "../src/credentials.rs"]
+#[allow(dead_code)]
+mod credentials;
+
+#[path = "../src/workspace.rs"]
+#[allow(dead_code)]
+mod workspace;
+
 #[path = "../src/ipc.rs"]
 #[allow(dead_code)]
 mod ipc;
@@ -29,9 +37,12 @@ use windows_sys::Win32::System::Threading::{
 // These real Node endpoints qualify transport faults, never SDK or GUI readiness.
 const HOST: &str = r#"
 import { spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
+import { resolve, toNamespacedPath } from 'node:path';
 writeFileSync('../started.txt', String(process.pid));
 let pending = Buffer.alloc(0);
+let bootstrapped = false;
+let nativePending;
 function send(value) {
   const payload = Buffer.from(JSON.stringify(value));
   const header = Buffer.alloc(4);
@@ -45,6 +56,64 @@ process.stdin.on('data', chunk => {
     if (pending.length < length + 4) break;
     const request = JSON.parse(pending.subarray(4, length + 4));
     pending = pending.subarray(length + 4);
+    if (!bootstrapped) {
+      writeFileSync('../bootstrap.json', JSON.stringify(request));
+      const expectedPath = toNamespacedPath(resolve('../data'));
+      const nativePath = toNamespacedPath(request.params?.appDataDir);
+      if (Object.keys(request).length !== 3 || request.id !== 'native-bootstrap' || request.method !== 'native.bootstrap' || Object.keys(request.params).length !== 1 || nativePath !== expectedPath) process.exit(1);
+      bootstrapped = true;
+      if (existsSync('../reject-bootstrap')) {
+        setTimeout(() => send({id:request.id,ok:true,value:{state:'initialized',extra:true}}), 300);
+      } else send({id:request.id,ok:true,value:{state:'initialized'}});
+      continue;
+    }
+    if (request.native) {
+      if (!nativePending) process.exit(2);
+      if (request.native.id === 'redact') {
+        send({id:nativePending.id,ok:request.native.ok,value:request.native.value,error:request.native.error});
+        nativePending = undefined;
+        continue;
+      }
+      if (request.native.id === 'scope-open') {
+        if (!request.native.ok) process.exit(3);
+        send({native:{id:'secret-read',method:'credential.read',params:nativePending.params}});
+      } else {
+        const value = { privateOnly: true, available: request.native.ok,
+          length: request.native.value?.secret?.length ?? 0, code: request.native.error?.code };
+        send({id:nativePending.id,ok:true,value});
+        nativePending = undefined;
+      }
+      continue;
+    }
+    if (request.method === 'control-malformed') {
+      send({event:{frame:'control',kind:'stream.resync',sessionId:'session1',fromSeq:-1}});
+      continue;
+    }
+    if (request.method === 'control-batch') {
+      for (let index = 0; index < 3; index++) send({event:{frame:'control',kind:'stream.resync',sessionId:'session1',fromSeq:index}});
+    }
+    if (request.method === 'control-overflow') {
+      for (let index = 0; index < 9; index++) send({event:{frame:'control',kind:'stream.resync',sessionId:'session1',fromSeq:index}});
+      continue;
+    }
+    if (request.method === 'native-malformed') {
+      send({native:{id:'bad',method:'credential.read',params:{target:'invalid',actionId:'a'}}});
+      continue;
+    }
+    if (request.method === 'native-redact') {
+      nativePending = request;
+      send({native:{id:'redact',method:'credential.redact',params:request.params}});
+      continue;
+    }
+    if (request.method === 'native-read' || request.method === 'native-flood-read') {
+      if (request.method === 'native-flood-read') {
+        for (let seq = 0; seq < 1100; seq++) send({event:{kind:'flood',seq}});
+        send({event:{frame:'control',kind:'stream.resync',sessionId:'session1',fromSeq:7}});
+      }
+      nativePending = request;
+      send({native:{id:'scope-open',method:'credential.scope.open',params:request.params}});
+      continue;
+    }
     if (request.method === 'hang') continue;
     if (request.method === 'stale') request.id = 'stale';
     if (request.method === 'oversize') {
@@ -69,7 +138,7 @@ process.stdin.on('data', chunk => {
       send({ id: request.id, ok: true, value: { sessionId, scopeId: 'w1', afterSeq } });
       for (let seq = 1; seq <= 300; seq++) {
         send({ event: {
-          schemaVersion: 1, protocolVersion: 1, recordId: `record${seq}`,
+          schemaVersion: 1, protocolVersion: 2, recordId: `record${seq}`,
           eventId: `event${seq}`, createdAt: '2026-10-26T00:00:00.000Z',
           sourceIds: [], sessionId, scopeId: 'w1', seq,
           durable: false, kind: 'turn.stream_delta',
@@ -201,7 +270,12 @@ impl Fixture {
     }
 
     fn spawn(&self) -> EngineChild {
-        EngineChild::spawn(&self.engine(), &self.expected_digest).unwrap()
+        EngineChild::spawn(
+            &self.engine(),
+            &self.expected_digest,
+            &self.directory.join("data"),
+        )
+        .unwrap()
     }
 
     fn cleanup(&self) -> std::io::Result<()> {
@@ -245,6 +319,46 @@ fn assert_running(process: &OwnedHandle) {
         unsafe { WaitForSingleObject(process.as_raw_handle(), 0) },
         WAIT_TIMEOUT
     );
+}
+
+#[test]
+fn bootstrap_is_first_and_malformed_reply_reaps_child() {
+    let fixture = Fixture::new();
+    let child = fixture.spawn();
+    let request: Value =
+        serde_json::from_slice(&fs::read(fixture.directory.join("bootstrap.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        request,
+        json!({"id":"native-bootstrap","method":"native.bootstrap","params":{"appDataDir":fixture.directory.join("data").to_str().unwrap().strip_prefix(r"\\?\").unwrap_or(fixture.directory.join("data").to_str().unwrap())}})
+    );
+    assert!(!fixture.directory.join("data").exists());
+    drop(child);
+    fs::remove_file(fixture.directory.join("started.txt")).unwrap();
+    fs::write(fixture.directory.join("reject-bootstrap"), b"").unwrap();
+    let engine = fixture.engine();
+    let digest = fixture.expected_digest.clone();
+    let data = fixture.directory.join("data");
+    let task = std::thread::spawn(move || {
+        EngineChild::spawn(&engine, &digest, &data)
+            .err()
+            .unwrap()
+            .code
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let started = fixture.directory.join("started.txt");
+    let pid = loop {
+        if let Ok(pid) = fs::read_to_string(&started)
+            && let Ok(pid) = pid.parse::<u32>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let process = observed_process(&json!(pid));
+    assert_eq!(task.join().unwrap(), "ENGINE_START");
+    assert_exited(&process);
 }
 
 fn assert_exited(process: &OwnedHandle) {
@@ -333,7 +447,7 @@ fn pushed_events_before_after_and_idle_preserve_reply_correlation() {
 }
 
 #[test]
-fn event_queue_is_bounded_and_drains_in_renderer_batches_without_loss() {
+fn event_queue_is_bounded_and_reports_required_reconciliation() {
     let fixture = Fixture::new();
     let mut child = fixture.spawn();
     let events = child.events();
@@ -347,13 +461,14 @@ fn event_queue_is_bounded_and_drains_in_renderer_batches_without_loss() {
     assert_eq!(events.pending_for_test().0, 1024);
     let mut observed = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while observed.len() < 1100 && Instant::now() < deadline {
+    while observed.len() < 1024 && Instant::now() < deadline {
         let batch = events.drain().unwrap();
         assert!(batch.len() <= 256);
         observed.extend(batch);
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(observed.len(), 1100);
+    assert_eq!(observed.len(), 1024);
+    assert_eq!(events.drain().unwrap_err().code, "ENGINE_BACKPRESSURE");
     for (seq, event) in observed.iter().enumerate() {
         assert_eq!(event["seq"], seq);
     }
@@ -388,15 +503,22 @@ fn event_byte_limits_bound_renderer_batches_and_keep_order() {
         .request(&json!({"id":"large","method":"flood-bytes","params":{}}))
         .unwrap();
     let saturation = Instant::now() + Duration::from_secs(3);
-    while events.pending_for_test().1 < 8_000_000 && Instant::now() < saturation {
+    while events.terminal_for_test().is_none() && Instant::now() < saturation {
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert_eq!(events.terminal_for_test(), Some("ENGINE_BACKPRESSURE"));
     let (_, pending_bytes) = events.pending_for_test();
     assert!((8_000_000..=8_388_608).contains(&pending_bytes));
     let mut count = 0;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while count < 70 && Instant::now() < deadline {
-        let batch = events.drain().unwrap();
+    while Instant::now() < deadline {
+        let batch = match events.drain() {
+            Ok(batch) => batch,
+            Err(error) => {
+                assert_eq!(error.code, "ENGINE_BACKPRESSURE");
+                break;
+            }
+        };
         assert!(batch.len() <= 27); // 28 framed events exceed the 4 MiB renderer batch limit.
         for event in batch {
             assert_eq!(event["seq"], count);
@@ -404,23 +526,18 @@ fn event_byte_limits_bound_renderer_batches_and_keep_order() {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(count, 70);
+    assert!(count > 0 && count < 70);
     child.stop().unwrap();
 }
 
 #[test]
-fn response_callback_precedes_post_reply_event_after_prior_queue_saturation() {
+fn response_callback_precedes_post_reply_event_after_prior_queued_event() {
     let fixture = Fixture::new();
     let mut child = fixture.spawn();
     let events = child.events();
     child
-        .request(&json!({"id":"flood","method":"flood","params":{}}))
+        .request(&json!({"id":"prior","method":"push-before","params":{}}))
         .unwrap();
-    let saturation = Instant::now() + Duration::from_secs(3);
-    while events.pending_for_test().0 < 1024 && Instant::now() < saturation {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(events.pending_for_test().0, 1024);
 
     let installed = Arc::new(AtomicBool::new(false));
     let observer_installed = installed.clone();
@@ -469,7 +586,12 @@ fn rejected_response_callback_fails_closed_and_wakes_reader() {
 #[test]
 fn native_channel_delivers_all_buffered_events_before_child_exit_lifecycle() {
     let fixture = Fixture::new();
-    let state = BridgeState::start(&fixture.engine(), &fixture.expected_digest).unwrap();
+    let state = BridgeState::start(
+        &fixture.engine(),
+        &fixture.expected_digest,
+        &fixture.directory.join("data"),
+    )
+    .unwrap();
     let timeline = Arc::new(Mutex::new(Vec::<Value>::new()));
     let event_sink = timeline.clone();
     let on_event = Channel::new(move |body| {
@@ -598,7 +720,8 @@ fn parent_termination_reaps_engine_and_descendant() {
         );
         let root = PathBuf::from(root);
         let expected = std::env::var("SPLYCE_PROCESS_CHILD_DIGEST").unwrap();
-        let mut child = EngineChild::spawn(&root.join("engine"), &expected).unwrap();
+        let mut child =
+            EngineChild::spawn(&root.join("engine"), &expected, &root.join("data")).unwrap();
         let reply = child
             .request(&json!({"id": "one", "method": "descendant", "params": {}}))
             .unwrap();
@@ -657,7 +780,14 @@ fn tampered_files_and_self_consistent_manifest_never_launch() {
     let fixture = Fixture::new();
     let changed_host = format!("{HOST}\n");
     fs::write(fixture.engine().join("host.mjs"), &changed_host).unwrap();
-    assert!(EngineChild::spawn(&fixture.engine(), &fixture.expected_digest).is_err());
+    assert!(
+        EngineChild::spawn(
+            &fixture.engine(),
+            &fixture.expected_digest,
+            &fixture.directory.join("data")
+        )
+        .is_err()
+    );
     assert!(!fixture.directory.join("started.txt").exists());
     let mut changed_manifest: Value = serde_json::from_slice(&fixture.manifest).unwrap();
     changed_manifest["files"][1]["sha256"] = Value::String(digest(changed_host.as_bytes()));
@@ -666,7 +796,14 @@ fn tampered_files_and_self_consistent_manifest_never_launch() {
         serde_json::to_vec(&changed_manifest).unwrap(),
     )
     .unwrap();
-    assert!(EngineChild::spawn(&fixture.engine(), &fixture.expected_digest).is_err());
+    assert!(
+        EngineChild::spawn(
+            &fixture.engine(),
+            &fixture.expected_digest,
+            &fixture.directory.join("data")
+        )
+        .is_err()
+    );
     assert!(!fixture.directory.join("started.txt").exists());
     fs::write(fixture.engine().join("host.mjs"), HOST).unwrap();
     fs::write(fixture.engine().join("manifest.json"), &fixture.manifest).unwrap();
@@ -676,5 +813,152 @@ fn tampered_files_and_self_consistent_manifest_never_launch() {
         .unwrap();
     assert_eq!(reply["id"], "restored");
     assert!(fixture.directory.join("started.txt").is_file());
+    child.stop().unwrap();
+}
+
+#[test]
+fn private_credential_lane_stays_out_of_events_and_preserves_command_matching() {
+    let reference = credentials::write_generated("transport-private-fixture").unwrap();
+    struct Cleanup(credentials::CredentialRef);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            credentials::delete_owned(&self.0).unwrap();
+        }
+    }
+    let cleanup = Cleanup(reference);
+    let fixture = Fixture::new();
+    let mut child = fixture.spawn();
+    let events = child.events();
+    let params = json!({"scopeId":"private-scope","target":cleanup.0.as_str(),"actionId":"action1","profileRevision":"p1","connectionRevision":"c1"});
+    let value = child
+        .request(&json!({"id":"ordinary-command","method":"native-read","params":params}))
+        .unwrap();
+    assert_eq!(
+        value,
+        json!({"id":"ordinary-command","ok":true,"value":{"privateOnly":true,"available":true,"length":25}})
+    );
+    assert!(events.drain().unwrap().is_empty());
+    let redacted = child.request(&json!({"id":"persistence-command","method":"native-redact","params":{"text":"transport-private-fixture"}})).unwrap();
+    assert_eq!(
+        redacted,
+        json!({"id":"persistence-command","ok":true,"value":{"text":"[REDACTED:credential]","redactedCount":1}})
+    );
+    assert!(events.drain().unwrap().is_empty());
+    assert_eq!(
+        child
+            .request(&json!({"id":"next","method":"echo","params":{}}))
+            .unwrap()["id"],
+        "next"
+    );
+    child.stop().unwrap();
+}
+
+#[test]
+fn malformed_private_frame_terminates_transport_without_renderer_payload() {
+    let fixture = Fixture::new();
+    let mut child = fixture.spawn();
+    let events = child.events();
+    let error = child
+        .request(&json!({"id":"bad","method":"native-malformed","params":{}}))
+        .unwrap_err();
+    assert_eq!(error.code, "ENGINE_FRAME");
+    assert!(!child.is_running());
+    assert!(events.drain().is_err());
+}
+
+#[test]
+fn saturated_events_fail_explicitly_while_private_service_stays_live() {
+    let reference = credentials::write_generated("saturation-private-fixture").unwrap();
+    struct Cleanup(credentials::CredentialRef);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            credentials::delete_owned(&self.0).unwrap();
+        }
+    }
+    let cleanup = Cleanup(reference);
+    let fixture = Fixture::new();
+    let mut child = fixture.spawn();
+    let events = child.events();
+    let params = json!({"scopeId":"saturated-scope","target":cleanup.0.as_str(),"actionId":"a1","profileRevision":"p1","connectionRevision":"c1"});
+    let reply = child
+        .request(&json!({"id":"private","method":"native-flood-read","params":params}))
+        .unwrap();
+    assert_eq!(reply["value"]["available"], true);
+    assert_eq!(events.pending_for_test().0, 1024);
+    assert_eq!(
+        events.drain().unwrap(),
+        vec![json!({"frame":"control","kind":"stream.resync","sessionId":"session1","fromSeq":7})]
+    );
+    let mut count = 0;
+    loop {
+        match events.drain() {
+            Ok(batch) => {
+                assert!(!batch.is_empty());
+                for event in batch {
+                    assert_eq!(event["seq"], count);
+                    count += 1;
+                }
+            }
+            Err(error) => {
+                assert_eq!(error.code, "ENGINE_BACKPRESSURE");
+                break;
+            }
+        }
+    }
+    assert_eq!(count, 1024);
+    child.stop().unwrap();
+    let mut recovered = fixture.spawn();
+    assert_eq!(
+        recovered
+            .request(&json!({"id":"recovery","method":"push-before","params":{}}))
+            .unwrap()["ok"],
+        true
+    );
+    assert_eq!(recovered.events().drain().unwrap()[0]["kind"], "before");
+    recovered.stop().unwrap();
+}
+
+#[test]
+fn priority_control_lane_rejects_invalid_cursor_and_bounds_pending_frames() {
+    for (method, code, expected_controls) in [
+        ("control-malformed", "ENGINE_FRAME", 0),
+        ("control-overflow", "ENGINE_BACKPRESSURE", 8),
+    ] {
+        let fixture = Fixture::new();
+        let mut child = fixture.spawn();
+        let events = child.events();
+        assert_eq!(
+            child
+                .request(&json!({"id":"controls","method":method,"params":{}}))
+                .unwrap_err()
+                .code,
+            code
+        );
+        if expected_controls > 0 {
+            assert_eq!(events.drain().unwrap().len(), expected_controls);
+        }
+        assert!(events.drain().is_err());
+        assert!(!child.is_running());
+    }
+}
+
+#[test]
+fn priority_controls_respect_single_frame_renderer_batches() {
+    let fixture = Fixture::new();
+    let mut child = fixture.spawn();
+    let mut events = child.events();
+    events.renderer_limits_for_test(1, process::MAX_FRAME_BYTES);
+    child
+        .request(&json!({"id":"batch","method":"control-batch","params":{}}))
+        .unwrap();
+    for cursor in 0..3 {
+        assert_eq!(
+            events.drain().unwrap(),
+            vec![
+                json!({"frame":"control","kind":"stream.resync","sessionId":"session1","fromSeq":cursor})
+            ]
+        );
+    }
+    assert!(events.drain().unwrap().is_empty());
     child.stop().unwrap();
 }

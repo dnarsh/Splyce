@@ -100,7 +100,7 @@ const CALLER_AUTH_HEADERS: ReadonlySet<string> = new Set([
 
 type HeaderSource = Record<string, string | null | undefined> | undefined;
 
-function assertNoCallerAuthHeaders(...sources: HeaderSource[]): void {
+export function assertNoCallerAuthHeaders(...sources: HeaderSource[]): void {
 	for (const source of sources) {
 		for (const [name, value] of Object.entries(source ?? {})) {
 			if (value !== null && value !== undefined && CALLER_AUTH_HEADERS.has(name.toLowerCase())) {

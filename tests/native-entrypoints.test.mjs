@@ -417,8 +417,9 @@ registerHooks({ load(url, context, next) {
   const result = next(url, context);
   if (targets.some(target => url.endsWith(target))) {
     const source = String(result.source);
-    if (!source.includes('assertSplyceReady();')) throw new Error('mutation target not found');
-    let mutated = source.replaceAll('assertSplyceReady();', 'void 0;');
+    const fence = /(?:assertSplyceReady|assertSameSplyceOwner|assertSplyceLoopStream)\\([^;]*?\\);/g;
+    if (!fence.test(source)) throw new Error('mutation target not found');
+    let mutated = source.replace(fence, 'void 0;').replaceAll('getSplyceAgentCallbacks(this)', 'this');
     if (url.endsWith('/agent/dist/splyce-admission.js')) {
       const binding = 'const admission = tool && admissions.get(tool);';
       if (!mutated.includes(binding)) throw new Error('binding mutation target not found');
@@ -475,15 +476,8 @@ registerHooks({ load(url, context, next) {
         ["/coding-agent/dist/core/sdk.js"],
         /SDK denial must precede input option access/,
       ],
-      [
-        "SDK session creation",
-        [
-          "/coding-agent/dist/core/sdk.js",
-          "/coding-agent/dist/core/model-runtime.js",
-          "/coding-agent/dist/core/resource-loader.js",
-        ],
-        /denied startup must not execute extension code/,
-      ],
+      // Owned SDK creation has no ambient runtime/loader fallback to activate.
+      // The SDK probe above retains input-access ordering; loader probes retain physical effects.
       [
         "resource reload",
         ["/coding-agent/dist/core/resource-loader.js"],
@@ -531,7 +525,11 @@ registerHooks({ load(url, context, next) {
           maxBuffer: 1024 * 1024,
         },
       );
-      assert.ifError(result.error);
+      assert.equal(
+        result.error,
+        undefined,
+        `${name}: ${result.stdout}\n${result.stderr}\n${result.error?.message}`,
+      );
       assert.equal(result.signal, null, `${name}: mutation probe timed out`);
       assert.notEqual(
         result.status,

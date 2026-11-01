@@ -1,6 +1,8 @@
-import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import { createNativeHost } from "./native-host.mjs";
+import { NativeControl } from "./native-control.mjs";
+import { StoreError } from "../dist/store.js";
 import {
   CONTRACT_VERSION,
   PROTOCOL_VERSION,
@@ -73,32 +75,17 @@ export async function* readFrames(input) {
   if (headerBytes || payload) throw new FrameError();
 }
 
-async function unavailableHandshake() {
-  const { createAgentSession } =
-    await import("@earendil-works/pi-coding-agent");
-  let result;
-  try {
-    result = await createAgentSession();
-  } catch (error) {
-    if (error?.code !== "SPLYCE_UNAVAILABLE") throw error;
-    return validateHandshake({
-      protocolVersion: PROTOCOL_VERSION,
-      schemaVersion: CONTRACT_VERSION,
-      engineProtocolVersion: PROTOCOL_VERSION,
-      bridgeProtocolVersion: PROTOCOL_VERSION,
-      piRevision: PI_REVISION,
-      entryMode: FOUNDATION.entryMode,
-      disabledBuiltinExtensions: [...FOUNDATION.disabledBuiltinExtensions],
-      readiness: {
-        state: "unavailable",
-        policy: false,
-        store: false,
-        receipts: false,
-      },
-    });
-  }
-  await result.session.dispose();
-  throw new Error("Native unavailable readiness was not enforced");
+function nativeHandshake(host) {
+  return validateHandshake({
+    protocolVersion: PROTOCOL_VERSION,
+    schemaVersion: CONTRACT_VERSION,
+    engineProtocolVersion: PROTOCOL_VERSION,
+    bridgeProtocolVersion: PROTOCOL_VERSION,
+    piRevision: PI_REVISION,
+    entryMode: FOUNDATION.entryMode,
+    disabledBuiltinExtensions: [...FOUNDATION.disabledBuiltinExtensions],
+    readiness: host.handshakeReadiness,
+  });
 }
 
 export function isRequest(value) {
@@ -121,39 +108,228 @@ export function isRequest(value) {
   );
 }
 
-export async function runHost(input = process.stdin, output = process.stdout) {
-  const handshake = await unavailableHandshake();
-  for await (const request of readFrames(input)) {
-    if (!isRequest(request)) throw new FrameError();
+export async function runHost(
+  input = process.stdin,
+  output = process.stdout,
+  createHost = createNativeHost,
+) {
+  let host;
+  let stopped = false;
+  let failure;
+  let queued = 0;
+  let writes = Promise.resolve();
+  let operations = Promise.resolve();
+  const lifetime = new AbortController();
+  let native;
+  const fail = (error) => {
+    failure ??= error;
+    lifetime.abort();
+    native?.shutdown();
+    input.destroy?.();
+  };
+  const write = (value) => {
+    const frame = encodeFrame(value);
+    writes = writes.then(
+      () =>
+        new Promise((resolveWrite, rejectWrite) => {
+          const finish = (error) => {
+            clearTimeout(timer);
+            output.removeListener("close", closed);
+            output.removeListener("error", closed);
+            lifetime.signal.removeEventListener("abort", closed);
+            if (error) {
+              output.destroy?.();
+              rejectWrite(new FrameError());
+            } else resolveWrite();
+          };
+          const closed = () => finish(true);
+          const timer = setTimeout(closed, 10_000);
+          timer.unref();
+          output.once("close", closed);
+          output.once("error", closed);
+          lifetime.signal.addEventListener("abort", closed, { once: true });
+          if (lifetime.signal.aborted || output.destroyed) return closed();
+          try {
+            output.write(frame, finish);
+          } catch {
+            closed();
+          }
+        }),
+    );
+    writes.catch(fail);
+    return writes;
+  };
+  native = new NativeControl(write, fail);
+  async function handle(request) {
+    if (stopped || failure) return;
     let reply;
     let shutdown = false;
-    if (
+    if (host === undefined) {
+      // The native parent sends this before exposing any renderer command.
+      if (
+        request.id !== "native-bootstrap" ||
+        request.method !== "native.bootstrap" ||
+        Object.keys(request.params).length !== 1 ||
+        !Object.hasOwn(request.params, "appDataDir")
+      )
+        throw new FrameError();
+      host = createHost(request.params.appDataDir, native);
+      reply = { id: request.id, ok: true, value: { state: "initialized" } };
+    } else if (request.method === "native.bootstrap") {
+      throw new FrameError();
+    } else if (request.method === "native.workspace.admit") {
+      try {
+        const workspace = host.admitWorkspace(request.params);
+        reply = { id: request.id, ok: true, value: workspace };
+      } catch (error) {
+        if (
+          !(error instanceof StoreError) ||
+          ![
+            "WORKSPACE_INPUT",
+            "WORKSPACE_PATH_INVALID",
+            "WORKSPACE_IDENTITY_CHANGED",
+            "WORKSPACE_ADMISSION_CHANGED",
+          ].includes(error.code)
+        )
+          throw error;
+        reply = {
+          id: request.id,
+          ok: false,
+          error: {
+            code: "POLICY_DENIED",
+            message: "Workspace admission unavailable",
+            correlationId: request.id,
+            retryable: false,
+          },
+        };
+      }
+    } else if (
       request.method === "handshake" &&
       Object.keys(request.params).length === 1 &&
       request.params.protocolVersion === PROTOCOL_VERSION
     ) {
-      reply = { id: request.id, ok: true, value: handshake };
+      reply = { id: request.id, ok: true, value: nativeHandshake(host) };
     } else if (
       request.method === "shutdown" &&
       Object.keys(request.params).length === 0
     ) {
       reply = { id: request.id, ok: true, value: { state: "stopped" } };
       shutdown = true;
+    } else if (request.method === "send" && request.params.frame === "setup") {
+      const params = request.params;
+      const validId =
+        typeof params.requestId === "string" &&
+        params.requestId.length > 0 &&
+        Buffer.byteLength(params.requestId, "utf8") <= 128 &&
+        !/[\s\\/]/u.test(params.requestId);
+      if (
+        Object.keys(params).length === 4 &&
+        ["frame", "command", "requestId", "payload"].every((key) =>
+          Object.hasOwn(params, key),
+        ) &&
+        params.command === "metadata" &&
+        validId &&
+        params.payload !== null &&
+        typeof params.payload === "object" &&
+        !Array.isArray(params.payload) &&
+        Object.keys(params.payload).length === 0
+      ) {
+        reply = {
+          id: request.id,
+          ok: true,
+          value: {
+            workspaces: host.listWorkspaces(),
+            readiness: host.handshakeReadiness,
+          },
+        };
+      } else {
+        reply = {
+          id: request.id,
+          ok: false,
+          error: {
+            code: "POLICY_DENIED",
+            message: "Native command unavailable",
+            correlationId: validId ? params.requestId : request.id,
+            retryable: false,
+          },
+        };
+      }
     } else {
+      let code = "POLICY_DENIED";
+      if (request.method === "send") {
+        try {
+          await host.assertCurrent(request.params.scopeId, {
+            configRevision: request.params.expectedConfigRevision,
+            profileRevision: request.params.expectedProfileRevision,
+            policyRevision: request.params.expectedPolicyRevision,
+          });
+        } catch (error) {
+          if (error?.code === "STALE_REVISION") code = error.code;
+          else if (
+            ![
+              "NATIVE_INVALID_ID",
+              "NATIVE_CONFIG_UNAVAILABLE",
+              "NATIVE_PROFILE_UNAVAILABLE",
+              "NATIVE_PROFILE_STALE",
+            ].includes(error?.code)
+          )
+            throw error;
+        }
+      }
       reply = {
         id: request.id,
         ok: false,
         error: {
-          code: "POLICY_DENIED",
+          code,
           message:
-            "Engine unavailable until native policy, store and receipts are connected",
+            "Generation unconfigured; native runnable ports are unavailable",
           correlationId: request.id,
           retryable: false,
         },
       };
     }
-    if (!output.write(encodeFrame(reply))) await once(output, "drain");
-    if (shutdown) return;
+    await write(reply);
+    if (shutdown) {
+      stopped = true;
+      input.destroy?.();
+    }
+  }
+  try {
+    try {
+      // Private responses must keep moving while an ordinary operation awaits a credential.
+      for await (const request of readFrames(input)) {
+        if (
+          request &&
+          typeof request === "object" &&
+          Object.hasOwn(request, "native")
+        ) {
+          native.accept(request);
+          continue;
+        }
+        if (!isRequest(request) || queued >= 8) throw new FrameError();
+        queued += 1;
+        operations = operations
+          .then(() => handle(request))
+          .catch(fail)
+          .finally(() => {
+            queued -= 1;
+          });
+      }
+    } catch (error) {
+      if (!stopped && !failure) fail(error);
+    }
+    // EOF revokes pending native reads; late responses cannot outlive this host.
+    native.shutdown();
+    await operations;
+    try {
+      await writes;
+    } catch (error) {
+      fail(error);
+    }
+    if (failure) throw failure;
+  } finally {
+    native.shutdown();
+    host?.close();
   }
 }
 

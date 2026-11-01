@@ -25,11 +25,15 @@ import {
 	type AgentState,
 	type AgentTool,
 	type AgentToolCallOutcome,
+	assertSameSplyceOwner,
 	assertSplyceReady,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	disposeSplyceOwner,
+	inheritSplyceOwner,
 	type PrepareNextTurnContext,
 	runToolCall,
+	sealSplyceAgentCallbacks,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import { contentText, getCurrentSystemMessage, getCurrentTools, retryDelayMs } from "@earendil-works/pi-ai";
@@ -484,6 +488,13 @@ export class AgentSession {
 	private _runSystemPromptOptions?: NormalizedBuildSystemPromptOptions;
 
 	constructor(config: AgentSessionConfig) {
+		if (inheritSplyceOwner(config, this, "session")) {
+			assertSameSplyceOwner(this, config.agent, "agent");
+			assertSameSplyceOwner(this, config.sessionManager, "session-manager");
+			assertSameSplyceOwner(this, config.settingsManager, "settings-manager");
+			assertSameSplyceOwner(this, config.resourceLoader, "resource-loader");
+			assertSameSplyceOwner(this, config.modelRuntime, "model-runtime");
+		}
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
@@ -524,6 +535,7 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 		if (this._usesDefaultTools) this._restoreToolsFromTranscript(this._defaultToolModifiers);
+		if (inheritSplyceOwner(config, this, "session")) sealSplyceAgentCallbacks(this, this.agent);
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -651,29 +663,33 @@ export class AgentSession {
 	 * happens here instead of in wrappers.
 	 */
 	private _installAgentToolHooks(): void {
-		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
-		this.agent.afterToolCall = (context) => this._afterToolCall(context);
+		this.agent.beforeToolCall = (context, signal) => this._beforeToolCall(context, undefined, signal);
+		this.agent.afterToolCall = (context, signal) => this._afterToolCall(context, undefined, signal);
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
 	private async _beforeToolCall(
 		{ toolCall, args }: BeforeToolCallContext,
 		parentToolCallId?: string,
+		signal?: AbortSignal,
 	): Promise<BeforeToolCallResult | undefined> {
-		assertSplyceReady();
+		assertSplyceReady(this);
 		const runner = this._extensionRunner;
 		if (!runner.hasHandlers("tool_call")) {
 			return undefined;
 		}
 
 		try {
-			return await runner.emitToolCall({
+			const result = await runner.emitToolCall({
 				type: "tool_call",
 				toolName: toolCall.name,
 				toolCallId: toolCall.id,
 				...(parentToolCallId ? { parentToolCallId } : {}),
 				input: args as Record<string, unknown>,
 			});
+			assertSplyceReady(this);
+			signal?.throwIfAborted();
+			return result;
 		} catch (err) {
 			if (err instanceof Error) {
 				throw err;
@@ -686,7 +702,10 @@ export class AgentSession {
 	private async _afterToolCall(
 		{ toolCall, args, result, isError }: AfterToolCallContext,
 		parentToolCallId?: string,
+		signal?: AbortSignal,
 	): Promise<AfterToolCallResult | undefined> {
+		assertSplyceReady(this);
+		signal?.throwIfAborted();
 		const runner = this._extensionRunner;
 		const hookResult = runner.hasHandlers("tool_result")
 			? await runner.emitToolResult({
@@ -703,6 +722,8 @@ export class AgentSession {
 				})
 			: undefined;
 
+		assertSplyceReady(this);
+		signal?.throwIfAborted();
 		const content = hookResult?.content ?? result.content ?? [];
 		// Runs after the extension hook so images injected or replaced by extensions are normalized too.
 		const resizeOptions = this._limitsModel()?.inputLimits?.images?.resize;
@@ -711,6 +732,8 @@ export class AgentSession {
 			...(resizeOptions ? { resizeOptions } : {}),
 		});
 
+		assertSplyceReady(this);
+		signal?.throwIfAborted();
 		if (!hookResult && normalizedContent === content) {
 			return undefined;
 		}
@@ -735,6 +758,7 @@ export class AgentSession {
 		args: unknown,
 		options: ExecuteToolOptions,
 	): Promise<AgentToolCallOutcome> {
+		assertSplyceReady(this);
 		this._nestedToolCalls ??= new NestedToolCallRunner({
 			getTools: () => this._getCallableTools(),
 			isSequential: () => this.agent.toolExecution === "sequential",
@@ -752,8 +776,8 @@ export class AgentSession {
 					tools: this._getCallableTools(),
 					assistantMessage,
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
-					beforeToolCall: (context) => this._beforeToolCall(context, parentId),
-					afterToolCall: (context) => this._afterToolCall(context, parentId),
+					beforeToolCall: (context, signal) => this._beforeToolCall(context, parentId, signal),
+					afterToolCall: (context, signal) => this._afterToolCall(context, parentId, signal),
 					signal,
 					onUpdate,
 				});
@@ -809,9 +833,13 @@ export class AgentSession {
 					},
 					signal,
 				);
+				assertSplyceReady(this);
+				signal?.throwIfAborted();
 				return { previous, context: previous?.context ?? canonicalContext, projection };
 			};
 			let { previous, context, projection } = await prepare();
+			assertSplyceReady(this);
+			signal?.throwIfAborted();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
 			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
@@ -891,7 +919,11 @@ export class AgentSession {
 		this.agent.finishTurn = async (turn, signal) => {
 			this._boundaryDispatchedMessages.add(turn.message);
 			const extensionContinue = await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
+			assertSplyceReady(this);
+			signal?.throwIfAborted();
 			const previousDecision = await previousFinishTurn?.(turn, signal);
+			assertSplyceReady(this);
+			signal?.throwIfAborted();
 			if (previousDecision?.action === "end") return previousDecision;
 			if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
 			return undefined;
@@ -899,14 +931,19 @@ export class AgentSession {
 	}
 
 	private _installAgentNextTurnRefresh(): void {
+		const previousPrepareNextTurn = this.agent.prepareNextTurn;
 		const previousPrepareNextTurnWithContext =
 			this.agent.prepareNextTurnWithContext ??
-			(this.agent.prepareNextTurn
-				? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await this.agent.prepareNextTurn?.(signal)
+			(previousPrepareNextTurn
+				? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await previousPrepareNextTurn?.(signal)
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
 			const context = await this._compactBeforeNextAssistantResponse(turn.context);
+			assertSplyceReady(this);
+			signal?.throwIfAborted();
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.({ ...turn, context }, signal);
+			assertSplyceReady(this);
+			signal?.throwIfAborted();
 			const nextContext = previousSnapshot?.context ?? context;
 			const runOptions = this._runSystemPromptOptions ?? this._baseSystemPromptOptions;
 			const options = normalizeBuildSystemPromptOptions({
@@ -1025,6 +1062,7 @@ export class AgentSession {
 	}
 
 	private _commitBoundaryDrafts(drafts: SessionBoundaryDraft[]): void {
+		assertSplyceReady(this);
 		const appended = this._applyBoundaryDrafts(this.sessionManager, drafts);
 		this._refreshFinalizedContext();
 		for (const entry of appended) this._emit({ type: "entry_appended", entry });
@@ -1104,6 +1142,7 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		assertSplyceReady(this);
 		// An abort requested while the run was starting, e.g. during before_agent_start, stops it
 		// here. agent_start is awaited before the first request.
 		if (event.type === "agent_start" && this._agentRunAbortRequested) this.agent.abort();
@@ -1144,6 +1183,7 @@ export class AgentSession {
 
 		// Emit to extensions first, then notify public listeners.
 		await this._emitExtensionEvent(event);
+		assertSplyceReady(this);
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
 		// Handle session persistence
@@ -1413,6 +1453,7 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		disposeSplyceOwner(this);
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -1456,6 +1497,7 @@ export class AgentSession {
 
 	/** Persist the cache-warming mode and immediately reconcile active warming. */
 	setCacheWarmingMode(mode: CacheWarmingMode): void {
+		assertSplyceReady(this);
 		this.settingsManager.setCacheWarmingMode(mode);
 		this._cacheWarmer?.onModeChanged();
 	}
@@ -1539,6 +1581,7 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
+		assertSplyceReady(this);
 		const previous = this.getActiveToolNames();
 		this._setActiveTools(toolNames);
 		// A loadout that deactivates a tool replaces the restored one, whose pending tools are dropped.
@@ -1688,6 +1731,8 @@ export class AgentSession {
 
 	/** Update scoped models for cycling */
 	setScopedModels(scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>): void {
+		assertSplyceReady(this);
+		for (const scoped of scopedModels) assertSameSplyceOwner(this, scoped.model, "model");
 		this._scopedModels = scopedModels;
 	}
 
@@ -1791,6 +1836,8 @@ export class AgentSession {
 		const previousTransformContext = this.agent.transformContext;
 		this.agent.transformContext = async (messages, signal) => {
 			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
+			assertSplyceReady(this);
+			signal?.throwIfAborted();
 			const hidden = this._hiddenDeclarations;
 			if (hidden.size === 0) return transformed;
 			return transformed.map((message) => {
@@ -1811,6 +1858,8 @@ export class AgentSession {
 		const previousTransformContext = this.agent.transformContext;
 		this.agent.transformContext = async (messages, signal) => {
 			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
+			assertSplyceReady(this);
+			signal?.throwIfAborted();
 			const forced = this._runSystemPromptOptions?.forceSystemPrompt;
 			if (forced === undefined) return transformed;
 			const current = getCurrentSystemMessage(transformed);
@@ -1874,6 +1923,7 @@ export class AgentSession {
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
 	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
+		assertSplyceReady(this);
 		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
 		let messages: AgentMessage[];
@@ -1886,6 +1936,7 @@ export class AgentSession {
 			this._resolveIdleWaitIfIdle();
 			throw error;
 		}
+		assertSplyceReady(this);
 		// Messages held while the run was starting go before its starting messages, as they would
 		// have while idle. No run exists yet, so they cannot split a tool call from its result.
 		this._flushPendingBashMessages();
@@ -2047,11 +2098,13 @@ export class AgentSession {
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
 	): Promise<{ text: string; images: ImageContent[] | undefined } | undefined> {
+		assertSplyceReady(this);
 		if (!this._extensionRunner.hasHandlers("input")) {
 			return { text, images };
 		}
 
 		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior);
+		assertSplyceReady(this);
 		if (inputResult.action === "handled") {
 			return undefined;
 		}
@@ -2093,6 +2146,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		assertSplyceReady(this);
 		if (this._isEmittingAgentSettled) {
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
 			return;
@@ -2243,6 +2297,7 @@ export class AgentSession {
 		behavior: "steer" | "followUp",
 		source: InputSource,
 	): Promise<QueuedInputDisposition> {
+		assertSplyceReady(this);
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
 		}
@@ -2361,6 +2416,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		assertSplyceReady(this);
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -2396,6 +2452,7 @@ export class AgentSession {
 	}
 
 	private _appendCustomMessage(appMessage: CustomMessage): void {
+		assertSplyceReady(this);
 		this.sessionManager.appendCustomMessageEntry(
 			appMessage.customType,
 			appMessage.content,
@@ -2542,6 +2599,7 @@ export class AgentSession {
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
+		assertSameSplyceOwner(this, model, "model");
 		if (!(await this._modelRuntime.checkAuth(model.provider))) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
@@ -2677,6 +2735,7 @@ export class AgentSession {
 	 * Persists the requested level to global defaults only when options.persist is true.
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
+		assertSplyceReady(this);
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
@@ -2765,6 +2824,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
+		assertSplyceReady(this);
 		this.agent.steeringMode = mode;
 		this.settingsManager.setSteeringMode(mode);
 	}
@@ -2774,6 +2834,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
+		assertSplyceReady(this);
 		this.agent.followUpMode = mode;
 		this.settingsManager.setFollowUpMode(mode);
 	}
@@ -2829,6 +2890,7 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		assertSplyceReady(this);
 		await this.abort();
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
@@ -3310,6 +3372,7 @@ export class AgentSession {
 	 * Toggle auto-compaction setting.
 	 */
 	setAutoCompactionEnabled(enabled: boolean): void {
+		assertSplyceReady(this);
 		this.settingsManager.setCompactionEnabled(enabled);
 	}
 
@@ -3319,7 +3382,7 @@ export class AgentSession {
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
-		assertSplyceReady();
+		assertSplyceReady(this);
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
 		}
@@ -3346,6 +3409,7 @@ export class AgentSession {
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
+		assertSplyceReady(this);
 		if (!this._extensionRunner.hasHandlers("resources_discover")) {
 			return;
 		}
@@ -3422,6 +3486,9 @@ export class AgentSession {
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
+		if (inheritSplyceOwner(this, runner, "runner")) {
+			assertSameSplyceOwner(this, runner, "runner");
+		}
 		const getCommands = (): SlashCommandInfo[] => {
 			const extensionCommands: SlashCommandInfo[] = runner.getRegisteredCommands().map((command) => ({
 				name: command.invocationName,
@@ -3468,6 +3535,7 @@ export class AgentSession {
 					});
 				},
 				appendEntry: (customType, data) => {
+					assertSameSplyceOwner(this, runner, "runner");
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
@@ -3481,6 +3549,7 @@ export class AgentSession {
 					return this.sessionManager.getSessionName();
 				},
 				setLabel: (entryId, label) => {
+					assertSameSplyceOwner(this, runner, "runner");
 					this.sessionManager.appendLabelChange(entryId, label);
 				},
 				getActiveTools: () => this.getActiveToolNames(),
@@ -3626,6 +3695,9 @@ export class AgentSession {
 			toolRegistry.set(tool.name, tool);
 		}
 		this._toolRegistry = toolRegistry;
+		for (const tool of toolRegistry.values()) {
+			inheritSplyceOwner(this, tool, "tool");
+		}
 
 		const nextActiveToolNames = (
 			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]
@@ -3722,6 +3794,7 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		assertSplyceReady(this);
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
@@ -3886,6 +3959,7 @@ export class AgentSession {
 	 * Toggle auto-retry setting.
 	 */
 	setAutoRetryEnabled(enabled: boolean): void {
+		assertSplyceReady(this);
 		this.settingsManager.setRetryEnabled(enabled);
 	}
 
@@ -3942,6 +4016,7 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		assertSplyceReady(this);
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
 			command,
@@ -4005,6 +4080,7 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	setSessionName(name: string): void {
+		assertSplyceReady(this);
 		this.sessionManager.appendSessionInfo(name);
 		const event = { type: "session_info_changed", name: this.sessionManager.getSessionName() } as const;
 		this._emit(event);
@@ -4030,6 +4106,7 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		assertSplyceReady(this);
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}
@@ -4351,6 +4428,7 @@ export class AgentSession {
 	 * @returns Path to exported file
 	 */
 	async exportToHtml(outputPath?: string, options: { themeName?: string } = {}): Promise<string> {
+		assertSplyceReady();
 		const themeName = [options.themeName, this.settingsManager.getTheme()].find(
 			(candidate) => candidate !== undefined && getThemeByName(candidate) !== undefined,
 		);
@@ -4377,6 +4455,7 @@ export class AgentSession {
 	 * @returns The resolved output file path.
 	 */
 	exportToJsonl(outputPath?: string): string {
+		assertSplyceReady();
 		return exportSessionToJsonl(this.sessionManager, outputPath);
 	}
 

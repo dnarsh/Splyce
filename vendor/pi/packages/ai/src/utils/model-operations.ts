@@ -1,3 +1,4 @@
+import type { SplyceCredentials } from "../splyce-credentials.ts";
 import type {
 	AnyModel,
 	Api,
@@ -14,24 +15,28 @@ import type {
 } from "../types.ts";
 import { ModelsError } from "./models-error.ts";
 
-/** The type of a model. Models without `type` are chat models. */
-/**
- * APIs whose adapters honour `credentials` (the shared Splyce lease option, see splyce-credentials.ts). Any other API must
- * refuse the option rather than ignore it: ignoring it would let the adapter fall back to an ambient key. The owner of
- * each adapter adds its API here when it is bound.
- */
+/** Only adapters bound to native credentials may bypass ordinary provider auth. */
 export const CREDENTIAL_APIS: ReadonlySet<string> = new Set([
 	"anthropic-messages",
 	"google-generative-ai",
 	"google-vertex",
+	"openai-completions",
+	"openai-responses",
+	"openai-codex-responses",
+	"mistral-conversations",
+	"pi-messages",
 ]);
 
-export function assertCredentialsSupported(api: string, options: { credentials?: unknown } | undefined): void {
+export function assertCredentialsSupported(
+	api: string,
+	options: { credentials?: SplyceCredentials | undefined } | undefined,
+): void {
 	if (options?.credentials && !CREDENTIAL_APIS.has(api)) {
 		throw new Error(`credentials are not supported for api ${api} yet`);
 	}
 }
 
+/** The type of a model. Models without `type` are chat models. */
 export function getModelType(model: AnyModel): ModelType {
 	return model.type ?? "chat";
 }

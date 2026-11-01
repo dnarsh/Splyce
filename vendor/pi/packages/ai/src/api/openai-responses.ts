@@ -1,6 +1,16 @@
 import OpenAI from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
 import { clampThinkingLevel } from "../models.ts";
+import {
+	assertCredentialApiIdentity,
+	assertCredentialOptions,
+	createLeasedFetch,
+	redactEventWithLease,
+	redactResponseWithLease,
+	redactWithLease,
+	type SplyceCredentials,
+	withLeasedSecret,
+} from "../splyce-credentials.ts";
 import type {
 	Api,
 	AssistantMessage,
@@ -109,12 +119,13 @@ function getConfigurationUpdateEffort(
 	model: Model<"openai-responses">,
 	options: OpenAIResponsesOptions | undefined,
 	compat: Required<OpenAIResponsesCompat>,
+	chatGPTSignIn: boolean,
 ): string | undefined {
 	if (
 		!compat.supportsMidConvoEffort ||
 		!options?.reasoningEffort ||
 		// Sign in with ChatGPT rejects configuration_update items.
-		isChatGPTSignIn(model, options.apiKey)
+		chatGPTSignIn
 	) {
 		return undefined;
 	}
@@ -162,14 +173,13 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 	// Start async processing
 	(async () => {
 		const compat = getCompat(model);
-		const configurationUpdateEffort = getConfigurationUpdateEffort(model, options, compat);
+		let credentials: SplyceCredentials | undefined;
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
 			api: model.api as Api,
 			provider: model.provider,
 			model: model.id,
-			...(configurationUpdateEffort === undefined ? {} : { providerThinkingLevel: configurationUpdateEffort }),
 			usage: {
 				input: 0,
 				output: 0,
@@ -184,7 +194,20 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 
 		try {
 			// Create OpenAI client
-			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
+			assertCredentialOptions(options ?? {}, model.headers);
+			assertCredentialApiIdentity(model.api, "openai-responses", options);
+			credentials = options?.credentials;
+			const chatGPTSignIn = credentials
+				? await withLeasedSecret(credentials, (secret) => isChatGPTSignIn(model, secret))
+				: isChatGPTSignIn(model, options?.apiKey);
+			const configurationUpdateEffort = getConfigurationUpdateEffort(model, options, compat, chatGPTSignIn);
+			if (configurationUpdateEffort !== undefined) output.providerThinkingLevel = configurationUpdateEffort;
+			const apiKey = credentials
+				? "splyce-leased"
+				: getClientApiKey(model.provider, options?.apiKey, options?.headers);
+			const fetch = credentials
+				? createLeasedFetch(credentials, "authorization", options?.fetch, (secret) => `Bearer ${secret}`)
+				: options?.fetch;
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
 			const grammarToolInputProperties = createGrammarToolInputProperties(
@@ -197,7 +220,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				apiKey,
 				options?.headers,
 				options?.identity,
-				options?.fetch,
+				fetch,
 				cacheSessionId,
 			);
 			let params = buildParams(
@@ -207,6 +230,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				compat,
 				grammarToolInputProperties,
 				configurationUpdateEffort,
+				chatGPTSignIn,
 			);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
@@ -225,11 +249,20 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 					signal: options?.signal,
 				},
 			);
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			await options?.onResponse?.(
+				await redactResponseWithLease(credentials, {
+					status: response.status,
+					headers: headersToRecord(response.headers),
+				}),
+				model,
+			);
 			stream.push({ type: "start", partial: output });
 
+			const observe = options?.onProviderStreamEvent;
 			await processResponsesStream(openaiStream, output, stream, model, {
-				onProviderStreamEvent: options?.onProviderStreamEvent,
+				onProviderStreamEvent: observe
+					? async (event, activeModel) => observe(await redactEventWithLease(credentials, event), activeModel)
+					: undefined,
 				serviceTier: options?.serviceTier,
 				grammarToolInputProperties,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
@@ -249,20 +282,22 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			// Failed or cancelled output must not expose executable tool calls.
+			output.content = output.content.filter((block) => block.type !== "toolCall");
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			const errorMessage = formatProviderError(
+			delete output.errorMessage;
+			let errorMessage = formatProviderError(
 				normalizeProviderError(error),
 				`${model.provider === "openai" ? "OpenAI" : model.provider} API error`,
 			);
 			// Sign in with ChatGPT shares the subscription's usage limit with other apps.
 			// On ChatGPT Business plans, the workspace admin also sets a per-user limit.
 			if (errorMessage.includes("subscription_sharing_usage_limit_exceeded")) {
-				output.errorMessage = `${errorMessage}\nCheck your ChatGPT usage: ${CHATGPT_USAGE_URL}`;
+				errorMessage = `${errorMessage}\nCheck your ChatGPT usage: ${CHATGPT_USAGE_URL}`;
 			} else if (errorMessage.includes("subscription_sharing_workplace_individual_usage_limit_exceeded")) {
-				output.errorMessage = `${errorMessage}\n${CHATGPT_WORKSPACE_LIMIT_HINT}`;
-			} else {
-				output.errorMessage = errorMessage;
+				errorMessage = `${errorMessage}\n${CHATGPT_WORKSPACE_LIMIT_HINT}`;
 			}
+			output.errorMessage = await redactWithLease(credentials, errorMessage);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -276,7 +311,7 @@ export const streamSimple: StreamFunction<"openai-responses", SimpleStreamOption
 	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
-	getClientApiKey(model.provider, options?.apiKey, options?.headers);
+	if (!options?.credentials) getClientApiKey(model.provider, options?.apiKey, options?.headers);
 
 	const base = {
 		...buildBaseOptions(model, context, options, options?.apiKey),
@@ -329,6 +364,8 @@ function createClient(
 
 	return new OpenAI({
 		apiKey,
+		// Injected transports own diagnostics and account metadata; do not add ambient SDK values.
+		...(fetch ? { logLevel: "off" as const, organization: null, project: null } : {}),
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,
@@ -343,6 +380,7 @@ function buildParams(
 	compat: Required<OpenAIResponsesCompat>,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
 	configurationUpdateEffort: string | undefined,
+	chatGPTSignIn: boolean,
 ) {
 	const transcriptTools = resolveTranscriptTools(context.messages, getResponsesToolSupport(compat));
 	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
@@ -359,7 +397,7 @@ function buildParams(
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 	// Sign in with ChatGPT rejects these request fields.
-	const omitUnsupportedFields = isChatGPTSignIn(model, options?.apiKey);
+	const omitUnsupportedFields = chatGPTSignIn;
 	const params: ResponseCreateParamsStreaming = {
 		model: model.id,
 		input: messages,

@@ -303,4 +303,70 @@ describe("TD-29 Modules.svelte", () => {
       "does not configure generation",
     );
   });
+
+  it("TD-68: explains a switched-off module in text and adds no control", async () => {
+    await render({ snapshot: w10Modules });
+
+    const help = row("fixture-a").querySelector<HTMLElement>(
+      '[data-testid="optional-state-help"]',
+    );
+    expect(help).not.toBeNull();
+    expect(help!.getAttribute("data-state")).toBe("off");
+    expect(help!.getAttribute("aria-label")).toContain("Switched off");
+    expect(help!.textContent).toContain("Switched off");
+    // The glyph is decoration; the condition is readable text.
+    expect(help!.querySelector('[aria-hidden="true"]')).not.toBeNull();
+    // Help never acts: every control in the row belongs to the module itself.
+    expect(
+      help!.querySelectorAll("button, a[href], input, select, textarea").length,
+    ).toBe(0);
+    expect(help!.textContent).toContain("Fixture editor A");
+  });
+
+  it("TD-68: stays silent for a module that is installed and ready", async () => {
+    await render({ snapshot: w10ReadyForEnable });
+
+    expect(
+      row("fixture-d").querySelector('[data-testid="optional-state-help"]'),
+    ).toBeNull();
+    // A is still off, so silence is per-row, not global.
+    expect(
+      row("fixture-a").querySelector('[data-testid="optional-state-help"]'),
+    ).not.toBeNull();
+  });
+
+  it("TD-68: calls an incompatible catalog option unsupported, not a choice", async () => {
+    const snapshot = {
+      ...w10Modules,
+      entries: w10Modules.entries.map((entry) =>
+        entry.packageId === "fixture-cleanup"
+          ? { ...entry, incompatibleReason: "requires Windows 11 24H2" }
+          : entry,
+      ),
+    };
+    await render({ snapshot });
+
+    (byTestId("add-module") as HTMLButtonElement).click();
+    flushSync();
+
+    const option = document.querySelector<HTMLElement>(
+      '[data-testid="add-option"][data-package-id="fixture-cleanup"]',
+    )!;
+    const help = option.querySelector<HTMLElement>(
+      '[data-testid="optional-state-help"]',
+    );
+    expect(help).not.toBeNull();
+    expect(help!.getAttribute("data-state")).toBe("unsupported");
+    expect(help!.textContent).toContain("Not supported on this computer");
+    expect(
+      option.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+        .disabled,
+    ).toBe(true);
+    // A compatible option gets no unsupported claim.
+    expect(
+      document.querySelector(
+        '[data-testid="add-option"][data-package-id="fixture-a"] [data-testid="optional-state-help"]',
+      ),
+    ).toBeNull();
+  });
 });

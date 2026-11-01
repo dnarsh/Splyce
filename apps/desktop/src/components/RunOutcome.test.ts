@@ -120,10 +120,14 @@ describe("TD-36 RunOutcome", () => {
     expect(t.querySelector("[data-testid=run-outcome-retry]")).toBeNull();
   });
 
-  it("missing usage renders nothing; unavailable is not zero", () => {
-    expect(
-      render({ outcome: ok }).querySelector("[data-testid=usage-view]"),
-    ).toBeNull();
+  it("missing usage is stated, not silent; unavailable is not zero", () => {
+    // A blank region reads as zero, so an absent report says so.
+    const missing = render({ outcome: ok });
+    const notReported = missing.querySelector(
+      "[data-testid=usage-not-reported]",
+    );
+    expect(notReported).not.toBeNull();
+    expect(notReported?.textContent).toContain("not reported");
     const t = render({
       outcome: ok,
       usage: { semantics: "unavailable", inputTokens: 0, costUsd: 0 },

@@ -1,9 +1,11 @@
 <script lang="ts">
   import ConnectionCard from "../components/provider/ConnectionCard.svelte";
+  import CredentialForm from "../components/provider/CredentialForm.svelte";
   import CustomEndpointForm from "../components/provider/CustomEndpointForm.svelte";
   import {
     groupByFamily,
     type ConnectionInput,
+    type CredentialDraft,
     type CustomEndpointDraft,
   } from "../stores/profiles";
 
@@ -11,10 +13,13 @@
     connections,
     families,
     onAddCustom,
+    credentialSubmit,
   }: {
     connections: readonly ConnectionInput[];
     families: readonly string[];
     onAddCustom: (draft: CustomEndpointDraft) => void;
+    /** Injected once the native credential writer exists; omitted means unavailable. */
+    credentialSubmit?: (draft: CredentialDraft) => Promise<void>;
   } = $props();
 
   const groups = $derived(groupByFamily(connections, families));
@@ -28,6 +33,7 @@
 
 <main aria-labelledby="providers-title">
   <h2 id="providers-title">Provider connections</h2>
+  <CredentialForm submit={credentialSubmit} />
   {#each groups as group (group.apiFamily)}
     <section aria-labelledby={`fam-${group.apiFamily}`} data-testid="family">
       <h3 id={`fam-${group.apiFamily}`}>{group.apiFamily}</h3>

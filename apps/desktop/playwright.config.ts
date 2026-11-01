@@ -4,7 +4,7 @@ const executablePath = process.env.SPLYCE_BROWSER_PATH;
 
 export default defineConfig({
   testDir: "./tests",
-  testMatch: /.*\.e2e\.spec\.ts/,
+  testMatch: ["**/*.e2e.spec.ts", "**/gui/*.spec.ts"],
   fullyParallel: false,
   use: {
     baseURL: "http://localhost:1421",

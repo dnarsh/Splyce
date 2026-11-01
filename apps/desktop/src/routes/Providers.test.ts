@@ -102,6 +102,17 @@ describe("provider grouping", () => {
     expect(card.textContent).toContain("Configured");
   });
 
+  it("never prints a credential or endpoint reference and only the sanitised origin", () => {
+    render([conn("a", "openai-completions", "configured")]);
+    const text = document.querySelector(
+      "[data-testid=connection]",
+    )!.textContent!;
+    expect(text).not.toContain("credential:");
+    expect(text).not.toContain("/v1");
+    expect(text).toContain("https://a.example.test");
+    expect(text).toContain("openai-completions connection");
+  });
+
   it("shows local egress as staying on the device", () => {
     expect(
       toConnectionView(
@@ -245,7 +256,7 @@ describe("custom endpoint validation", () => {
     };
     const submit = () => {
       document
-        .querySelector("form")!
+        .querySelector('form[aria-labelledby="custom-title"]')!
         .dispatchEvent(
           new SubmitEvent("submit", { bubbles: true, cancelable: true }),
         );
@@ -340,10 +351,14 @@ describe("accessibility", () => {
     render([conn("a", "openai-completions", "missing")]);
     const name = (el: Element): string => {
       const labelledBy = el.getAttribute("aria-labelledby");
+      const id = el.getAttribute("id");
       return (
         el.getAttribute("aria-label") ??
         (labelledBy
           ? document.getElementById(labelledBy)?.textContent
+          : null) ??
+        (id
+          ? document.querySelector(`label[for="${id}"]`)?.textContent
           : null) ??
         el.closest("label")?.textContent ??
         el.textContent ??
@@ -361,7 +376,13 @@ describe("accessibility", () => {
     for (const el of controls) expect(name(el), el.outerHTML).not.toBe("");
     for (const el of document.querySelectorAll("input, button")) {
       expect(el.getAttribute("tabindex")).toBeNull();
-      expect((el as HTMLButtonElement).disabled).toBe(false);
+      // A control may only be disabled on purpose: inside a disabled fieldset
+      // that carries the visible reason, never a lone dead control.
+      if ((el as HTMLButtonElement).disabled)
+        expect(
+          el.closest("fieldset[disabled]")?.textContent?.trim(),
+        ).toBeTruthy();
+      else expect((el as HTMLButtonElement).disabled).toBe(false);
     }
   });
 

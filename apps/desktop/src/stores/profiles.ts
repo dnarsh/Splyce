@@ -8,14 +8,21 @@ export interface ConnectionInput {
   readonly record: ProviderConnectionRecord;
   readonly endpointLabel: string;
   readonly credential: CredentialStatus;
+  /**
+   * Optional user-chosen label. It is validated before display; anything URL-
+   * or credential-shaped falls back to "<apiFamily> connection" (TD-17 note).
+   */
+  readonly displayName?: string;
 }
 
 export interface ConnectionView {
   readonly id: string;
   readonly revision: string;
   readonly apiFamily: string;
-  readonly endpointLabel: string;
-  readonly credentialRef: string;
+  /** Sanitised user label, or "<apiFamily> connection"; never raw input. */
+  readonly displayName: string;
+  /** Sanitised origin only (scheme://host[:port]); never a path, query or userinfo. */
+  readonly endpointHost: string | null;
   readonly locality: "local" | "hosted";
   readonly egress: string;
   readonly credential: CredentialStatus;
@@ -39,28 +46,85 @@ const CREDENTIAL_ERROR: Record<
     "Credential store unavailable. This connection is unavailable; no other provider is used instead.",
 };
 
+const ENDPOINT_ERROR =
+  "Endpoint is not a valid http(s) URL. This connection is unavailable.";
+
+const DESTINATION_UNAVAILABLE = "Destination unavailable.";
+const LABEL_LIMIT = 64;
+
+/**
+ * Origin only: scheme + host + optional port. Path, query, fragment and any
+ * userinfo are dropped, because a URL can carry a token or a password and the
+ * renderer must never receive it. Non-http(s) text yields null, not a guess.
+ */
+export function endpointOrigin(text: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(text.trim());
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+  // URL.origin already strips userinfo, path, query and hash. Assert the shape
+  // rather than trusting it, so an "@", "?" or extra path can never slip through.
+  return /^https?:\/\/[^/?#@\s]+$/.test(url.origin) ? url.origin : null;
+}
+
+const CREDENTIAL_SHAPE = /^(sk|pk|rk|ghp|gho|ghs|github_pat|xox[abprs])[-_]/i;
+
+/** A label is displayed only when it cannot be a URL or a credential. */
+export function safeDisplayName(
+  candidate: string | undefined,
+  apiFamily: string,
+): string {
+  const fallback = `${apiFamily} connection`;
+  if (candidate === undefined) return fallback;
+  const trimmed = candidate.trim();
+  if (trimmed === "" || trimmed.length > LABEL_LIMIT) return fallback;
+  if (/[\r\n\t]/.test(trimmed)) return fallback;
+  if (trimmed.includes("://") || trimmed.includes("@")) return fallback;
+  if (CREDENTIAL_SHAPE.test(trimmed)) return fallback;
+  try {
+    // Anything the URL parser accepts is not a human label.
+    new URL(trimmed);
+    return fallback;
+  } catch {
+    return trimmed;
+  }
+}
+
 /** Copies whitelisted fields only, so unexpected input properties cannot reach state. */
 export function toConnectionView(input: ConnectionInput): ConnectionView {
-  const { record, endpointLabel, credential } = input;
+  const { record, endpointLabel, credential, displayName } = input;
+  const origin = endpointOrigin(endpointLabel);
   // A non-loopback endpoint is cloud egress whatever the record claims.
   const locality =
-    record.locality === "local" && isLoopbackUrl(endpointLabel)
+    record.locality === "local" && origin !== null && isLoopbackUrl(origin)
       ? "local"
       : "hosted";
+  const egress =
+    origin === null
+      ? DESTINATION_UNAVAILABLE
+      : locality === "local"
+        ? "Local: requests stay on this device"
+        : `Cloud: request content is sent to ${origin}`;
   return {
     id: record.providerConnectionId,
     revision: record.revision,
     apiFamily: record.apiFamily,
-    endpointLabel,
-    credentialRef: record.credentialRef,
+    displayName: safeDisplayName(displayName, record.apiFamily),
+    endpointHost: origin,
     locality,
-    egress:
-      locality === "local"
-        ? `Local: requests stay on this device (${endpointLabel})`
-        : `Cloud: request content is sent to ${endpointLabel}`,
+    egress,
     credential,
-    state: credential === "configured" ? "ready" : "unavailable",
-    error: credential === "configured" ? null : CREDENTIAL_ERROR[credential],
+    state:
+      origin !== null && credential === "configured" ? "ready" : "unavailable",
+    error:
+      origin === null
+        ? ENDPOINT_ERROR
+        : credential === "configured"
+          ? null
+          : CREDENTIAL_ERROR[credential],
   };
 }
 
@@ -88,6 +152,45 @@ export interface CustomEndpointDraft {
   readonly connectionId: string;
   readonly baseUrl: string;
   readonly headers: readonly HeaderDraft[];
+}
+
+/** What the native credential writer would receive; never persisted here. */
+export interface CredentialDraft {
+  readonly displayName: string;
+  readonly baseUrl: string;
+  readonly apiKey: string;
+}
+
+/**
+ * Field-by-field problems, never the values: an invalid key or URL must not be
+ * echoed back into the DOM or a log. Empty means valid.
+ */
+export function validateCredentialDraft(
+  draft: CredentialDraft,
+): readonly string[] {
+  const errors: string[] = [];
+  const name = draft.displayName.trim();
+  if (name === "") errors.push("Name is required.");
+  else if (safeDisplayName(name, "connection") !== name)
+    errors.push("Name must not look like a URL or a credential.");
+
+  const raw = draft.baseUrl.trim();
+  const key = normalized(raw);
+  if (key === null) errors.push("Base URL is not a valid URL.");
+  else {
+    const url = new URL(raw);
+    if (
+      url.protocol !== "https:" &&
+      !(url.protocol === "http:" && isLoopbackUrl(raw))
+    )
+      errors.push("Base URL must use https unless the endpoint is local.");
+    if (url.search !== "" || url.hash !== "" || /[?#]/.test(raw))
+      errors.push("Base URL must not contain a query string or fragment.");
+    if (url.username !== "" || url.password !== "")
+      errors.push("Base URL must not contain credentials; use the API key.");
+  }
+  if (draft.apiKey.trim() === "") errors.push("API key is required.");
+  return errors;
 }
 
 export interface ExistingEndpoint {

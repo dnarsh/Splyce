@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { assertSplyceReady } from "@earendil-works/pi-agent-core";
+import { assertSameSplyceOwner, assertSplyceReady, inheritSplyceOwner } from "@earendil-works/pi-agent-core";
 import { detectCapabilities, getTerminalColorMode, type TerminalColorMode } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME } from "../config.ts";
@@ -261,6 +261,7 @@ export function loadProjectContextFiles(options: {
 	cwd: string;
 	agentDir: string;
 }): Array<{ path: string; content: string }> {
+	assertSplyceReady();
 	const resolvedCwd = resolvePath(options.cwd);
 	const resolvedAgentDir = resolvePath(options.agentDir);
 
@@ -401,6 +402,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private loaded: boolean;
 
 	constructor(options: DefaultResourceLoaderOptions) {
+		if (inheritSplyceOwner(options, this, "resource-loader")) {
+			assertSameSplyceOwner(this, options.settingsManager!, "settings-manager");
+		}
 		this.cwd = resolvePath(options.cwd);
 		this.agentDir = resolvePath(options.agentDir);
 		this.settingsManager = options.settingsManager ?? SettingsManager.create(this.cwd, this.agentDir);
@@ -491,6 +495,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	extendResources(paths: ResourceExtensionPaths): void {
+		assertSplyceReady(this);
+		assertSplyceReady();
 		const skillPaths = this.normalizeExtensionPaths(paths.skillPaths ?? []);
 		const promptPaths = this.normalizeExtensionPaths(paths.promptPaths ?? []);
 		const themePaths = this.normalizeExtensionPaths(paths.themePaths ?? []);
@@ -531,6 +537,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	async loadProjectTrustExtensions(): Promise<LoadExtensionsResult> {
+		assertSplyceReady(this);
 		assertSplyceReady();
 		// Force untrusted project settings for the bootstrap pass. This keeps project-local
 		// extensions/packages out while still loading user/global and temporary CLI extensions.
@@ -540,6 +547,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	async reload(options?: ResourceLoaderReloadOptions): Promise<void> {
+		assertSplyceReady(this);
+		// Selected-resource admission must precede package acquisition or executable resource loading.
 		assertSplyceReady();
 		resetTimings("extensions");
 

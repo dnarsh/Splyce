@@ -1,7 +1,12 @@
 import type { MemoryObservationRecord } from "@splyce/pi/contracts";
 
-/** Engine-reported memory subsystem state; drives the honest empty state. */
-export type MemoryStatus = "on" | "off" | "unavailable";
+/**
+ * Engine-reported memory subsystem state plus the feed's own states; drives the
+ * honest empty state. `loading` is "no snapshot has arrived yet" and `error` is
+ * "the snapshot did not arrive" - neither of them means memory is empty, so
+ * they must never borrow the on-state copy.
+ */
+export type MemoryStatus = "loading" | "on" | "off" | "unavailable" | "error";
 
 export interface MemoryEntry {
   observation: MemoryObservationRecord;
@@ -16,14 +21,21 @@ export interface MemoryEntry {
   state: "active" | "purge-pending";
 }
 
-export function emptyMessage(status: MemoryStatus): string {
+export function emptyMessage(status: MemoryStatus, stale = false): string {
   switch (status) {
+    case "loading":
+      return "Loading remembered items…";
+    case "error":
+      return "Memory could not be loaded. What is remembered is unknown - not empty.";
     case "off":
       return "Memory is off. Nothing is being remembered.";
     case "unavailable":
       return "Memory is unavailable. Remembered items cannot be shown.";
     default:
-      return "Nothing is remembered yet.";
+      // A stale list cannot claim nothing is remembered: the snapshot may be old.
+      return stale
+        ? "No remembered items are shown, and this list may be out of date."
+        : "Nothing is remembered yet.";
   }
 }
 

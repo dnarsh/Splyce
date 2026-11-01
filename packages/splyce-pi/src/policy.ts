@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   CONTRACT_VERSION,
+  GRANT_CAPABILITIES,
   type ActionRecord,
+  type GrantRecord,
   type JsonValue,
   type RecordByKind,
   type RunRecord,
@@ -10,6 +12,9 @@ import {
   Store,
   StoreError,
   type CallerContext,
+  type DirectoryIdentity,
+  type GrantUse,
+  type OnceGrantConsumption,
   type WorkspaceOwnership,
 } from "./store.js";
 
@@ -45,7 +50,32 @@ export interface ActionPermit {
   targetScopeId: string;
   idempotencyKey: string;
   ownership: WorkspaceOwnership;
+  /** Explicit grant capability; never inferred from tool or capabilityId. */
+  capability: GrantRecord["capability"];
+  /** net.provider only: the qualified `scheme://host:port` origin. */
+  origin?: string;
 }
+
+/** Native read of the admitted workspace directory's current identity. */
+export interface WorkspaceIdentityPort {
+  observe(workspaceId: string): DirectoryIdentity;
+}
+
+/** fs.write and shell.run consume a once grant; fs.read and net.provider use a session grant. */
+const ONCE_CAPABILITIES: ReadonlySet<string> = new Set([
+  "fs.write",
+  "shell.run",
+]);
+
+/** Store grant/workspace failures that deny the action with a durable receipt. */
+const GRANT_DENIALS: ReadonlySet<string> = new Set([
+  "GRANT_REQUIRED",
+  "GRANT_REVOKED",
+  "GRANT_CONSUMED",
+  "GRANT_MISMATCH",
+  "WORKSPACE_NOT_ADMITTED",
+  "WORKSPACE_IDENTITY_CHANGED",
+]);
 
 function canonical(value: unknown): string {
   if (value === null || typeof value === "boolean" || typeof value === "string")
@@ -84,6 +114,7 @@ export class NativePolicy {
   private readonly store: Store;
   private readonly caller: CallerContext;
   private readonly current: () => CurrentPolicy;
+  private readonly identity: WorkspaceIdentityPort;
   private readonly permits = new Map<string, Readonly<ActionPermit>>();
   private readonly prepared = new Set<string>();
   private readonly pending = new Map<string, string>();
@@ -94,10 +125,12 @@ export class NativePolicy {
     store: Store,
     caller: CallerContext,
     current: () => CurrentPolicy,
+    identity: WorkspaceIdentityPort,
   ) {
     this.store = store;
     this.caller = Object.freeze({ ...caller });
     this.current = current;
+    this.identity = identity;
   }
 
   authorize(permit: ActionPermit): void {
@@ -135,6 +168,8 @@ export class NativePolicy {
     )
       throw new AdmissionError("ACTION_REQUIRES_RECONCILIATION");
     if (signal?.aborted) this.deny(permit, "CANCELED");
+    if (!(GRANT_CAPABILITIES as readonly unknown[]).includes(permit.capability))
+      this.deny(permit, "CAPABILITY_REQUIRED");
     const policy = this.current();
     if (
       permit.toolName !== toolName ||
@@ -172,6 +207,7 @@ export class NativePolicy {
       owner.epoch !== permit.ownership.epoch
     )
       this.deny(permit, "STALE_OWNERSHIP");
+    this.requireGrant(permit, ONCE_CAPABILITIES.has(permit.capability));
   }
 
   reserve(
@@ -316,39 +352,52 @@ export class NativePolicy {
       )?.record as ActionRecord | undefined;
       if (parent?.state !== "running") this.deny(permit, "PARENT_NOT_RUNNING");
     }
+    const once = ONCE_CAPABILITIES.has(permit.capability);
+    this.requireGrant(permit, once);
     const action = this.action(permit, "approved");
+    const receipts = [
+      { kind: "action" as const, record: action },
+      {
+        kind: "action" as const,
+        record: {
+          ...action,
+          recordId: randomUUID(),
+          state: "running" as const,
+        },
+      },
+    ];
+    const fences = {
+      expectedOwnershipEpoch: {
+        workspaceId: permit.ownership.workspaceId,
+        epoch: permit.ownership.epoch,
+      },
+      expectedActionReservation: {
+        scopeId: permit.targetScopeId,
+        idempotencyKey: permit.idempotencyKey,
+        actionId: permit.actionId,
+        recordId: proposal.recordId,
+      },
+    };
     try {
-      this.store.appendBatch(
-        [
-          { kind: "action", record: action },
-          {
-            kind: "action",
-            record: { ...action, recordId: randomUUID(), state: "running" },
-          },
-        ],
-        this.caller,
-        undefined,
-        {
-          workspaceId: permit.ownership.workspaceId,
-          epoch: permit.ownership.epoch,
-        },
-        undefined,
-        {
-          scopeId: permit.targetScopeId,
-          idempotencyKey: permit.idempotencyKey,
-          actionId: permit.actionId,
-          recordId: proposal.recordId,
-        },
-      );
+      if (once)
+        this.store.consumeOnceGrant(
+          this.grantUse(permit) as OnceGrantConsumption,
+          receipts,
+          this.caller,
+          fences,
+        );
+      else this.store.commitEvents(receipts, [], this.caller, fences);
     } catch (error) {
       if (
         error instanceof StoreError &&
         error.code === "ACTION_RESERVATION_CHANGED"
       )
         throw new AdmissionError("ACTION_REQUIRES_RECONCILIATION");
+      if (error instanceof StoreError && GRANT_DENIALS.has(error.code))
+        this.deny(permit, error.code);
       throw error;
     }
-    // No asynchronous callback separates the final fence from executor handoff.
+    // No asynchronous callback separates the final fences from executor handoff.
     this.check(toolCallId, toolName, signal);
     let result: T;
     try {
@@ -359,6 +408,34 @@ export class NativePolicy {
     }
     this.commitOutcome(action, result.isError || signal?.aborted === true);
     return result;
+  }
+
+  /** Native-only use: workspace identity is observed fresh on every call. */
+  private grantUse(permit: ActionPermit): GrantUse {
+    const once = ONCE_CAPABILITIES.has(permit.capability);
+    return {
+      grantId: permit.grantId,
+      workspaceId: permit.ownership.workspaceId,
+      sessionId: this.caller.sessionId,
+      capability: permit.capability,
+      observedIdentity: this.identity.observe(permit.ownership.workspaceId),
+      ...(once
+        ? { actionId: permit.actionId, argumentsDigest: permit.argumentsDigest }
+        : {}),
+      ...(permit.origin === undefined ? {} : { origin: permit.origin }),
+    };
+  }
+
+  private requireGrant(permit: ActionPermit, once: boolean): void {
+    const use = this.grantUse(permit);
+    try {
+      if (once) this.store.checkOnceGrantForActive(use as OnceGrantConsumption);
+      else this.store.requireGrant(use);
+    } catch (error) {
+      if (error instanceof StoreError && GRANT_DENIALS.has(error.code))
+        this.deny(permit, error.code);
+      throw error;
+    }
   }
 
   private deny(permit: ActionPermit, code: string): never {

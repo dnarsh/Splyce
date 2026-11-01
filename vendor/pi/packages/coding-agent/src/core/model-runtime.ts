@@ -1,5 +1,5 @@
 import { dirname, join } from "node:path";
-import { assertSplyceReady } from "@earendil-works/pi-agent-core";
+import { assertSameSplyceOwner, assertSplyceReady, inheritSplyceOwner } from "@earendil-works/pi-agent-core";
 import {
 	type AnyModel,
 	type Api,
@@ -217,11 +217,21 @@ export class ModelRuntime implements Models {
 	}
 
 	static async create(options: CreateModelRuntimeOptions = {}): Promise<ModelRuntime> {
-		assertSplyceReady();
+		assertSplyceReady(options);
+		assertSameSplyceOwner(options, options, "model-runtime-options");
+		if (
+			!options.credentials ||
+			!options.modelsStore ||
+			options.modelsPath !== null ||
+			options.allowModelNetwork !== false ||
+			options.refreshOnCreate !== false
+		)
+			assertSplyceReady();
 		const credentials = new RuntimeCredentials(options.credentials ?? DefaultAuthStorage.create(options.authPath));
 		const modelsPath =
 			options.modelsPath === null ? undefined : (options.modelsPath ?? join(getAgentDir(), "models.json"));
 		const config = await ModelConfig.load(modelsPath);
+		assertSplyceReady(options);
 		const modelsStore =
 			options.modelsStore ??
 			(modelsPath
@@ -249,6 +259,7 @@ export class ModelRuntime implements Models {
 			providers,
 			process.env.PI_OFFLINE === undefined,
 		);
+		inheritSplyceOwner(options, runtime, "model-runtime");
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
 		const refreshFromNetwork = runtime.modelNetworkEnabled && options.allowModelNetwork === true;
@@ -478,18 +489,22 @@ export class ModelRuntime implements Models {
 		providerId?: string,
 		options?: AuthOperationOptions,
 	): Promise<readonly ModelTypeMap[TType][]> {
+		assertSplyceReady();
 		return this.models.getAvailableOfType(type, providerId, options);
 	}
 
 	getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
+		assertSplyceReady();
 		return this.models.getAllAvailable(providerId, options);
 	}
 
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
+		assertSplyceReady();
 		return this.models.checkAuth(providerId, options);
 	}
 
 	async getAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly Model<Api>[]> {
+		assertSplyceReady();
 		if (providerId) {
 			const errorSeq = ++this.availabilityErrorSeq;
 			try {
@@ -561,6 +576,8 @@ export class ModelRuntime implements Models {
 		providerOrModel: string | AnyModel,
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
+		// Native provider admission must supply the final-send port before auth can be enabled.
+		assertSplyceReady();
 		if (typeof providerOrModel === "string") return this.models.getAuth(providerOrModel, overrides);
 		const resolution = await this.models.getAuth(providerOrModel, overrides);
 		if (!resolution) return undefined;
@@ -580,6 +597,7 @@ export class ModelRuntime implements Models {
 	}
 
 	private enqueueCredentialOperation<T>(providerId: string, signal: AbortSignal, task: () => Promise<T>): Promise<T> {
+		assertSplyceReady();
 		const previous = this.credentialOperations.get(providerId) ?? Promise.resolve();
 		let markStarted: (() => void) | undefined;
 		const started = new Promise<void>((resolve) => {
@@ -643,6 +661,7 @@ export class ModelRuntime implements Models {
 	}
 
 	listCredentials(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> {
+		assertSplyceReady();
 		return this.credentials.list(options);
 	}
 
@@ -669,6 +688,7 @@ export class ModelRuntime implements Models {
 		model: TModel;
 		options: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
 	}> {
+		assertSplyceReady(this);
 		assertSplyceReady();
 		const provider = this.models.getProvider(model.provider);
 		if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
@@ -857,6 +877,7 @@ export class ModelRuntime implements Models {
 	}
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
+		assertSplyceReady(this);
 		assertSplyceReady();
 		this.config = await ModelConfig.load(this.modelsPath);
 		this.configureRadiusProviders();

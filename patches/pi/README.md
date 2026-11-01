@@ -153,6 +153,18 @@ core patch to `packages/ai`, recorded here per [core fusion](../../research/docs
   redaction, no fallback). Provider-specific admission, per-send endpoint rechecks on the Google/Vertex SDK paths and
   cancellation of the SDK transport belong to TD-13/TD-16 and the native transport.
 
+## Native OpenAI request consumer
+
+`0010-native-openai-consumer.patch` adds the owned Pi API consumer for the native
+request-port contract. It consumes Chat Completions or Responses inside the
+request lifetime, copies and redacts observer data, and waits for asynchronous
+response cancellation before releasing the callback. It reuses the existing
+auth-header preflight through an additive shared helper export. The refreshed
+0006 patch also disables SDK logging and ambient SDK account metadata for
+injected transports. See the
+[consumer record](0010-native-openai-consumer.md) for patch order, local fixture
+evidence and the remaining native/installed integration boundary.
+
 ## Pinned model data hydration
 
 `0005-hydrate-pinned-model-catalog.patch` applies after patch 0003. It adds a
@@ -162,3 +174,43 @@ existing hydrator without changing the pin. The Windows staging gate uses this
 mode before its offline build; `tests/bootstrap/hydrate-pinned-model-data.test.mjs`
 checks successful hydration, unavailable revisions, hash mismatches and pin
 preservation (#77).
+
+## Scoped owned readiness recovery
+
+`0009-scoped-owned-readiness.patch` applies after 0008, against source snapshot
+`58022c3`. It retains Pi 1.4.0 and upstream ancestry
+`d5b3de22d0e24a3e9c38a9410d3329b099717283`.
+
+Native weak identity bindings connect explicitly supplied SDK dependencies,
+Agent options, initialized sessions, runners, tools and loop snapshots. The
+private composition entrypoint does not change default unavailability. Tools
+retain the current reservation, preparation, finish/discard and execution
+lifecycle and original admitted implementation. Session disposal revokes derived
+identities.
+
+Changed fork symbols are `Agent.createLoopConfig`, the public loop entrypoints,
+`prepareToolCall`, `executePreparedToolCall`, `finalizeExecutedToolCall`,
+`AgentSession` construction/tool hooks/disposal/runtime binding,
+`createAgentSession`, `ModelRuntime.create` and guarded provider/resource routes.
+`splyce-readiness.ts` captures initialized Agent callbacks after session wrappers
+and runtime setup, checks later replacements, and preserves callback ownership
+through request and continuation snapshots. Awaited callbacks recheck current
+ownership and cancellation before subsequent callbacks or effects. Streaming
+loop failures reach both iteration and `result()`. Subscriber and tool progress
+callbacks also recheck ownership and cancellation. Interrupted runs retain local
+failure state without invoking failure subscribers or adding failure transcript
+entries; still-current ordinary failures retain event reporting.
+
+`tests/native-owned-session.test.mjs` loads the actual SDK and native tool
+implementation, writes physical fixture bytes through real SQLite admission,
+checks foreign/disposed identities and callback replacement, and exercises
+revocation/cancellation during request, conversion, credential, tool and
+continuation hooks. Mutation checks require physical assertions to fail when
+callback or direct-tool guards are removed. Existing native entrypoint and
+admission suites retain their guard-removal checks.
+
+The fixture creates its own owner and demonstrates scoped APIs only. No
+production factory, installed GUI readiness, provider admission, resource
+selection, credential lifecycle or executor containment is qualified. Trusted
+in-process code retains OS authority. Reapply against the exact owned source
+and rerun these regressions after donor or wrapper changes.

@@ -84,26 +84,25 @@ import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { stream as streamGoogle } from "../src/api/google-generative-ai.ts";
 import { stream as streamVertex } from "../src/api/google-vertex.ts";
 import type { SplyceCredentials } from "../src/splyce-credentials.ts";
-import type { Api, Context, Model } from "../src/types.ts";
+import type { Api, Model } from "../src/types.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const SECRET = "e2e-secret-value-0123456789";
 const ADMITTED = "endpoint-admitted";
 
-const model = <TApi extends Api>(provider: string, api: TApi, baseUrl: string): Model<TApi> =>
-	({
-		id: "m-1",
-		name: "m-1",
-		api,
-		provider,
-		baseUrl,
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 100000,
-		maxTokens: 8000,
-	}) as unknown as Model<TApi>;
-const context = () => normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 1 }] } satisfies Context);
+const model = <TApi extends Api>(provider: string, api: TApi, baseUrl: string): Model<TApi> => ({
+	id: "m-1",
+	name: "m-1",
+	api,
+	provider,
+	baseUrl,
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 100000,
+	maxTokens: 8000,
+});
+const context = () => normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 1 }] });
 
 /** Interface-only upstream; this is the smallest faithful implementation: admit only the bound endpoint. */
 /** The per-action port the native layer constructs: the action's signal is bound at construction, so admit takes two arguments. */
